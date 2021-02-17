@@ -301,6 +301,15 @@ def fuse_conv_and_bn(conv, bn):
 
     return fusedconv
 
+def init_torch_seeds(seed=0):
+    import torch.backends.cudnn as cudnn
+    # Speed-reproducibility tradeoff https://pytorch.org/docs/stable/notes/randomness.html
+    torch.manual_seed(seed)
+    if seed == 0:  # slower, more reproducible
+        cudnn.benchmark, cudnn.deterministic = False, True
+    else:  # faster, less reproducible
+        cudnn.benchmark, cudnn.deterministic = True, False
+
 def initialize_weights(model):
     for m in model.modules():
         t = type(m)
@@ -362,3 +371,18 @@ if __name__ == '__main__':
         x = torch.randn((16, 3, 512, 512), device='cuda')
         y = yolo(x)
         print(f'In/Out: {x.size()} --> {y.size()}')
+
+    """
+    ---------- models/yolov5s.yaml ----------
+    Model Summary: 164 layers, 4.21M parameters, 4.21M gradients, 11.0 GFLOPS
+    In/Out: torch.Size([16, 3, 512, 512]) --> torch.Size([16, 512, 16, 16])
+    ---------- models/yolov5m.yaml ----------
+    Model Summary: 236 layers, 12.4M parameters, 12.4M gradients, 33.5 GFLOPS
+    In/Out: torch.Size([16, 3, 512, 512]) --> torch.Size([16, 768, 16, 16])
+    ---------- models/yolov5l.yaml ----------
+    Model Summary: 308 layers, 27.1M parameters, 27.1M gradients, 75.9 GFLOPS
+    In/Out: torch.Size([16, 3, 512, 512]) --> torch.Size([16, 1024, 16, 16])
+    ---------- models/yolov5x.yaml ----------
+    Model Summary: 380 layers, 50.3M parameters, 50.3M gradients, 144.3 GFLOPS
+    In/Out: torch.Size([16, 3, 512, 512]) --> torch.Size([16, 1280, 16, 16])
+    """

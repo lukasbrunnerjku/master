@@ -2,9 +2,12 @@ import torch
 from torch import nn
 from torch import optim
 from torchvision import models
+import sys
 
-def count_params(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+sys.path.append('./')
+from utils import count_params
+from yolo import Yolov5
+from ghostnet import ghostnet
 
 def get_backbone(model_class, pretrained=False):
     name = model_class.__name__
@@ -17,6 +20,12 @@ def get_backbone(model_class, pretrained=False):
     elif ('shufflenet' in name) or ('mobilenet' in name):
         model = model_class(pretrained=pretrained)
         modules = list(model.children())[:-1]
+        backbone = nn.Sequential(*modules)
+    elif name == 'Yolov5':
+        backbone = model_class()
+    elif name.lower() == 'ghostnet':
+        model = model_class()
+        modules = list(model.children())[:-4]
         backbone = nn.Sequential(*modules)
     else:
         raise NotImplementedError
@@ -105,6 +114,8 @@ def main():
         models.vgg16, 
         models.shufflenet_v2_x2_0, 
         models.mobilenet_v2,
+        Yolov5,
+        ghostnet,
     ]
     
     # without a dry run model performance of first model would be 
@@ -145,6 +156,18 @@ def main():
     In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 1280, 16, 16])
     Down ratio: 32.0
     Elapsed forward + backward time: 94.504ms
+    ---------- Yolov5 ----------
+    Parameters: 4.21M
+    Elapsed forward time (inference): 4.686ms
+    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 512, 16, 16])
+    Down ratio: 32.0
+    Elapsed forward + backward time: 61.813ms
+    ---------- ghostnet ----------
+    Parameters: 2.67M
+    Elapsed forward time (inference): 12.548ms
+    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 960, 16, 16])
+    Down ratio: 32.0
+    Elapsed forward + backward time: 110.154ms
     '''
 
 if __name__ == '__main__':

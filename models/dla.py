@@ -15,7 +15,7 @@ from convolutions import (DeformConv, SpatiallyConv,
 ConvBase = nn.Conv2d
 
 # --- basic blocks ----
-
+#TODO ReLU inplace!
 class Conv(nn.Module):
     def __init__(self, chi, cho, k=1, s=1, p=None, g=1, act=nn.ReLU(), affine=False):  
         super().__init__()
@@ -60,4 +60,21 @@ class BasicBlock(nn.Module):
         if residual is None:
             residual = x
         return residual + self.conv2(self.conv1(x)) 
+    
+# DLA - deep layer aggregation - structure
+chi, cho, k=1, s=1, p=None, g=1, act=nn.ReLU(), affine=False
+
+class Root(nn.Module):
+    def __init__(self, chi, cho, k, residual):
+        super().__init__()
+        self.conv = Conv(chi, cho, 1, 1, act=nn.Identity())
+        self.relu = nn.ReLu(inplace=True)
+        self.residual = residual
+
+    def forward(self, *x):
+        children = x
+        x = self.conv(torch.cat(x, 1))
+        if self.residual:
+            x += children[0]
+        return self.relu(x)
     

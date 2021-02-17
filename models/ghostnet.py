@@ -12,9 +12,6 @@ import torch.nn.functional as F
 import math
 
 
-__all__ = ['ghost_net']
-
-
 def _make_divisible(v, divisor, min_value=None):
     """
     This function is taken from the original tf repo.
@@ -250,10 +247,16 @@ def ghostnet(**kwargs):
     return GhostNet(cfgs, **kwargs)
 
 
-if __name__=='__main__':
+if __name__ == '__main__':
     model = ghostnet().cuda().eval()
-    print(model)
+    
+    # backbone only
+    modules = list(model.children())[:-4]
+    print('Number of Modules:', len(modules))
+    backbone = nn.Sequential(*modules)
+    
+    print(backbone)
     x = torch.randn((16, 3, 512, 512), device='cuda')
-    y = model(x)
+    y = backbone(x)
     print(f'In/Out: {x.size()} --> {y.size()}')
     
