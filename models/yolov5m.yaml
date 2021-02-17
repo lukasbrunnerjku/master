@@ -1,5 +1,6 @@
-depth_multiple: 1.0  # model depth multiple
-width_multiple: 1.0  # layer channel multiple
+# model size depends on multipliers
+depth_multiple: 0.67  # model depth multiple
+width_multiple: 0.75  # layer channel multiple
 
 # YOLOv5 backbone from yolov5l.yaml
 backbone:

@@ -21,7 +21,7 @@ class Conv(nn.Module):
         super(Conv, self).__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.act = nn.ReLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
@@ -261,21 +261,104 @@ def parse_model(d, ch):  # model_dict, input channels
         ch.append(c2)
     return nn.Sequential(*layers)
 
-class Yolov5Backbone(nn.Module):
-    def __init__(self, cfg='yolo_backbone.yaml', ch=3):  # input channels
+def sparsity(model):
+    # Return global model sparsity
+    a, b = 0., 0.
+    for p in model.parameters():
+        a += p.numel()
+        b += (p == 0).sum()
+    return b / a
+
+def prune(model, amount=0.3):
+    # Prune model to requested global sparsity
+    import torch.nn.utils.prune as prune
+    print('Pruning model... ', end='')
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            prune.l1_unstructured(m, name='weight', amount=amount)  # prune
+            prune.remove(m, 'weight')  # make permanent
+    print(' %.3g global sparsity' % sparsity(model))
+
+def fuse_conv_and_bn(conv, bn):
+    # Fuse convolution and batchnorm layers https://tehnokv.com/posts/fusing-batchnorm-and-conv/
+    fusedconv = nn.Conv2d(conv.in_channels,
+                          conv.out_channels,
+                          kernel_size=conv.kernel_size,
+                          stride=conv.stride,
+                          padding=conv.padding,
+                          groups=conv.groups,
+                          bias=True).requires_grad_(False).to(conv.weight.device)
+
+    # prepare filters
+    w_conv = conv.weight.clone().view(conv.out_channels, -1)
+    w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
+    fusedconv.weight.copy_(torch.mm(w_bn, w_conv).view(fusedconv.weight.size()))
+
+    # prepare spatial bias
+    b_conv = torch.zeros(conv.weight.size(0), device=conv.weight.device) if conv.bias is None else conv.bias
+    b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
+    fusedconv.bias.copy_(torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
+
+    return fusedconv
+
+def initialize_weights(model):
+    for m in model.modules():
+        t = type(m)
+        if t is nn.Conv2d:
+            pass  # nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif t is nn.BatchNorm2d:
+            m.eps = 1e-3
+            m.momentum = 0.03
+        elif t in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6]:
+            m.inplace = True
+            
+def model_info(model, verbose=False, img_size=640):
+    # Model information. img_size may be int or list, i.e. img_size=640 or img_size=[640, 320]
+    n_p = sum(x.numel() for x in model.parameters())  # number parameters
+    n_g = sum(x.numel() for x in model.parameters() if x.requires_grad)  # number gradients
+    if verbose:
+        print('%5s %40s %9s %12s %20s %10s %10s' % ('layer', 'name', 'gradient', 'parameters', 'shape', 'mu', 'sigma'))
+        for i, (name, p) in enumerate(model.named_parameters()):
+            name = name.replace('module_list.', '')
+            print('%5g %40s %9s %12g %20s %10.3g %10.3g' %
+                  (i, name, p.requires_grad, p.numel(), list(p.shape), p.mean(), p.std()))
+
+    try:  # FLOPS
+        from thop import profile
+        stride = int(model.stride.max()) if hasattr(model, 'stride') else 32
+        img = torch.zeros((1, model.yaml.get('ch', 3), stride, stride), device=next(model.parameters()).device)  # input
+        flops = profile(deepcopy(model), inputs=(img,), verbose=False)[0] / 1E9 * 2  # stride GFLOPS
+        img_size = img_size if isinstance(img_size, list) else [img_size, img_size]  # expand if int/float
+        fs = ', %.1f GFLOPS' % (flops * img_size[0] / stride * img_size[1] / stride)  # 640x640 GFLOPS
+    except (ImportError, Exception):
+        fs = ''
+
+    print(f"Model Summary: {len(list(model.modules()))} layers, {n_p / 10**6:0.3}M parameters, {n_g / 10**6:0.3}M gradients{fs}")
+
+class Yolov5(nn.Module):
+    def __init__(self, cfg='models/yolov5s.yaml', ch=3):  # input channels
         super().__init__()
         import yaml  # for torch hub
         self.yaml_file = Path(cfg).name
         with open(cfg) as f:
             self.yaml = yaml.load(f, Loader=yaml.SafeLoader)  # model dict
         self.model = parse_model(deepcopy(self.yaml), [ch])
+        # Init weights, biases
+        initialize_weights(self)
 
     def forward(self, x):
         return self.model(x)
 
 if __name__ == '__main__':
-    model = Yolov5Backbone().cuda().eval()
-    print(model)
-    x = torch.randn((16, 3, 512, 512), device='cuda')
-    y = model(x)
-    print(f'In/Out: {x.size()} --> {y.size()}')
+    # import sys
+    # sys.path.append('./')
+    
+    for cfg in ['models/yolov5s.yaml', 'models/yolov5m.yaml', 
+                'models/yolov5l.yaml', 'models/yolov5x.yaml']:
+        print(f'{10*"-"} {cfg} {10*"-"}')
+        yolo = Yolov5(cfg).cuda().eval()
+        model_info(yolo)
+
+        x = torch.randn((16, 3, 512, 512), device='cuda')
+        y = yolo(x)
+        print(f'In/Out: {x.size()} --> {y.size()}')

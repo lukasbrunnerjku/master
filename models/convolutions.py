@@ -3,16 +3,10 @@ from torch import nn
 from torch import optim
 from torch.nn import functional as F
 from torchvision import ops
+import sys
 
-def count_params(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-# ------ convolutions -------
-
-def autopad(k, p=None):
-    if p is None:  # pad s.t. same spatial shape after convolution
-        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]
-    return p
+sys.path.append('./')
+from utils import count_params, autopad 
 
 class DeformConv(nn.Module):
     def __init__(self, chi, cho, k, s=1, p=None, groups=1, bias=True):
@@ -114,6 +108,18 @@ class ShuffledGroupedConv(nn.Module):
         # use grouped convolution also for 1x1 convolutions (see ShuffleNet)
         # which are then called pointwise grouped convolutions
         self.conv = nn.Conv2d(chi, cho, k, s, p, groups=groups, bias=bias)
+        # example forward pass: 
+        # assume g=2 groups and 6 channels (=> n=3) 
+        # 111222 (entries of the two groups are 1 and 2 respectively) 
+        # reshaping to (2, 6): 
+        # 111
+        # 222
+        # transposing:
+        # 12
+        # 12
+        # 12
+        # flattening:
+        # 121212 => shuffled!
 
     def forward(self, x):
         x = self.conv(x)
@@ -125,18 +131,6 @@ class ShuffledGroupedConv(nn.Module):
         x = torch.transpose(x, 1, 2)
         # finally flatten dimension (g, n) => channels shuffled!
         x = x.reshape(x.size(0), -1, x.size(-2), x.size(-1))
-        
-        # note: assume g=2 groups and 6 channels (=> n=3) 
-        # 111222 (entries of the two groups are 1 and 2 respectively) 
-        # reshaping to (2, 6): 
-        # 111
-        # 222
-        # transposing:
-        # 12
-        # 12
-        # 12
-        # flattening:
-        # 121212 => shuffled!
         return x 
 
 def test_conv(Conv, n=10, benchmark=False):
@@ -201,71 +195,13 @@ def test_conv(Conv, n=10, benchmark=False):
     if benchmark:  # reset to default
         torch.backends.cudnn.benchmark = False
 
-# ------ basic building blocks -------
-
-class Focus(nn.Module):
-    def __init__(self, chi, cho):  
-        super().__init__()
-        # e.g. conv2d with bn and ReLU
-        self.conv = Conv
-
-    def forward(self, x):  # x(b, c, w, h) -> y(b, 4c, w/2, h/2)
-        return self.conv(torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], 
-            x[..., ::2, 1::2], x[..., 1::2, 1::2]], dim=1))
-
-class UpSample(nn.Module):
-    def __init__(self, scale_factor: float):
-        super().__init__() 
-        # learned upsampling, avoids checkerboard artifacts
-        self.scale_factor = scale_factor
-        self.conv_block = conv_block
-    
-    def forward(self, x):
-        x = F.interpolate(x, scale_factor=self.scale_factor, mode='nearest')
-        x = self.conv_block(x)
-        return x
-
-class Bottleneck(nn.Module):
-    def __init__(self, chi, cho, shortcut=True, groups=1, e=0.5):
-        super().__init__()
-        chh = int(cho * e)  # hidden channels
-        self.conv1 = Conv(chi, chh, 1, groups=groups)
-        self.conv2 = Conv(chh, cho, 3, groups=groups)
-        self.conv3 = Conv(chi, chh, 1, groups=groups)
-        self.add = shortcut and chi == cho
-
-    def forward(self, x):
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
-
-class BasicBlock(nn.Module):
-    def __init__(self, inplanes, planes, stride=1, dilation=1):
-        super(BasicBlock, self).__init__()
-        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3,
-                               stride=stride, padding=dilation,
-                               bias=False, dilation=dilation)
-        self.bn1 = BatchNorm(planes)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
-                               stride=1, padding=dilation,
-                               bias=False, dilation=dilation)
-        self.bn2 = BatchNorm(planes)
-        self.stride = stride
-
 if __name__ == '__main__':
-    # to get detailed cuda errors use:
+    # to get detailed cuda errors:
     # CUDA_LAUNCH_BLOCKING=1 python myscript.py
-    # OR
     # export CUDA_LAUNCH_BLOCKING=1
-    # OR
-    # run on cpu!
-    for Conv in 
-    test_conv(nn.Conv2d)  # sanity check of test function
-    test_conv(DeformConv)
-    test_conv(SpatiallyConv)
-    test_conv(DepthwiseConv)
-    test_conv(FlattenedConv)
-    test_conv(GroupedConv)
-    test_conv(ShuffledGroupedConv)
+    for Conv in [nn.Conv2d, DeformConv, SpatiallyConv, 
+        DepthwiseConv, FlattenedConv, GroupedConv, ShuffledGroupedConv]:
+        test_conv(Conv)
     
     '''
     ---------- Test Conv2d ----------
