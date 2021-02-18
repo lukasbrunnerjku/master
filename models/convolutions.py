@@ -9,17 +9,17 @@ sys.path.append('./')
 from utils import count_params, autopad 
 
 class DeformConv(nn.Module):
-    def __init__(self, chi, cho, k, s=1, p=None, groups=1, bias=True):
+    def __init__(self, chi, cho, k, s=1, p=None, dilation=1, groups=1, bias=True):
         super().__init__() 
         k = k if isinstance(k, tuple) else (k, k) 
         p = autopad(k, p)
         self.convolution = ops.DeformConv2d(chi, cho, k, s, p, 
-            groups=groups, bias=bias)
+            dilation=dilation, groups=groups, bias=bias)
         # for each group we need output channels of 2 to get for each kernel weight
         # offset position in x, y (2 channels) and we have to know that for every 
         # pixel in the convolution output, thus we use same kernel size and padding!!
         self.offset = nn.Conv2d(chi, groups * 2 * k[0] * k[1], k, s, p, 
-            groups=groups, bias=True)
+            dilation=dilation, groups=groups, bias=True)
         self._init_offset()
 
     def _init_offset(self):
@@ -32,73 +32,86 @@ class DeformConv(nn.Module):
         return self.convolution(x, self.offset(x))
 
 class SpatiallyConv(nn.Module):
-    def __init__(self, chi, cho, k, s=1, p=None, groups=1, bias=True):
+    def __init__(self, chi, cho, k, s=1, p=None, dilation=1, groups=1, bias=True):
         super().__init__() 
         # decreases complexity, but kernel space limited
         k = k if isinstance(k, tuple) else (k, k)
         p = p if isinstance(p, tuple) else (p, p)
+        s = s if isinstance(s, tuple) else (s, s)
         p = autopad(k, p)
-        self.conv1 = nn.Conv2d(chi, chi, (k[0], 1), s, (p[0], 0), 
-            groups=1, bias=bias)
-        self.conv2 = nn.Conv2d(chi, cho, (1, k[1]), s, (0, p[1]), 
-            groups=1, bias=bias)
+        self.conv1 = nn.Conv2d(chi, chi, (k[0], 1), (s[0], 1), (p[0], 0), 
+            dilation=dilation, groups=1, bias=bias)
+        self.conv2 = nn.Conv2d(chi, cho, (1, k[1]), (1, s[1]), (0, p[1]), 
+            dilation=dilation, groups=1, bias=bias)
         
     def forward(self, x):
         return self.conv2(self.conv1(x))
 
 class DepthwiseConv(nn.Module):
-    def __init__(self, chi, cho, k, s=1, p=None, groups=1, bias=True):
+    def __init__(self, chi, cho, k, s=1, p=None, dilation=1, groups=1, bias=True):
         super().__init__() 
         p = autopad(k, p)
         # decreases complexity, smaller networks can be wider,
         # each filter soley has access to a single input channel
         # and we keep the number of input channels at first
-        self.conv1 = nn.Conv2d(chi, chi, k, s, p, groups=chi, bias=bias)
+        self.conv1 = nn.Conv2d(chi, chi, k, s, p, 
+            dilation=dilation, groups=chi, bias=bias)
         # learn channelwise(inter group) correlation with 1x1 convolutions
-        self.conv2 = nn.Conv2d(chi, cho, 1, 1, 0, groups=1, bias=bias)
+        self.conv2 = nn.Conv2d(chi, cho, 1, 1, 0, 
+            dilation=dilation, groups=1, bias=bias)
 
     def forward(self, x):
         return self.conv2(self.conv1(x))
 
 class FlattenedConv(nn.Module):
-    def __init__(self, chi, cho, k, s=1, p=None, groups=1, bias=True):
+    def __init__(self, chi, cho, k, s=1, p=None, dilation=1, groups=1, bias=True):
         super().__init__() 
         # paper claims importance of bias term!
         k = k if isinstance(k, tuple) else (k, k)
         p = p if isinstance(p, tuple) else (p, p)
+        s = s if isinstance(s, tuple) else (s, s)
         p = autopad(k, p)
         # lateral, kernel: C x 1 x 1
         self.conv1 = nn.Conv2d(chi, cho, 1, 1, 0, groups=1, bias=True)
         # vertical, kernel: 1 x Y x 1
-        self.conv2 = nn.Conv2d(cho, cho, (k[0], 1), s, (p[0], 0), 
-                               groups=cho, bias=True)
+        self.conv2 = nn.Conv2d(cho, cho, (k[0], 1), (s[0], 1), (p[0], 0), 
+            dilation=dilation, groups=cho, bias=True)
         # horizontal, kernel: 1 x 1 x X,
         # last term can omit bias e.g. if batchnorm is done anyway afterwards 
-        self.conv3 = nn.Conv2d(cho, cho, (1, k[1]), s, (0, p[1]), 
-                               groups=cho, bias=bias)
+        self.conv3 = nn.Conv2d(cho, cho, (1, k[1]), (1, s[1]), (0, p[1]), 
+            dilation=dilation, groups=cho, bias=bias)
 
     def forward(self, x):
         return self.conv3(self.conv2(self.conv1(x)))
 
 class GroupedConv(nn.Module):
-    def __init__(self, chi, cho, k, s=1, p=None, groups=8, bias=True):
+    def __init__(self, chi, cho, k, s=1, p=None, dilation=1, groups=8, bias=True):
         super().__init__()  # typically groups are 2, 4, 8, 16
         p = autopad(k, p)
+        assert groups != 1
+        if chi % groups != 0 or cho % groups != 0:
+            print(f'Channel {chi} or {cho} not divisible by groups {groups}, using groups=1')
+            groups = 1
         # decreases complexity, the idea of grouped convolutions is that 
         # the correlation between feature channels is sparse anyway,
         # and here we will be even more sparse since we only allow 
         # intra channel group correlation, 
         # use grouped convolution also for 1x1 convolutions (see ShuffleNet)
         # which are then called pointwise grouped convolutions
-        self.conv = nn.Conv2d(chi, cho, k, s, p, groups=groups, bias=bias)
+        self.conv = nn.Conv2d(chi, cho, k, s, p, 
+            dilation=dilation, groups=groups, bias=bias)
 
     def forward(self, x):
         return self.conv(x)
 
 class ShuffledGroupedConv(nn.Module):
-    def __init__(self, chi, cho, k, s=1, p=None, groups=8, bias=True):
+    def __init__(self, chi, cho, k, s=1, p=None, dilation=1, groups=8, bias=True):
         super().__init__()  # typically groups are 2, 4, 8, 16
         self.cho = cho
+        assert groups != 1
+        if chi % groups != 0 or cho % groups != 0:
+            print(f'Channel {chi} or {cho} not divisible by groups {groups}, using groups=1')
+            groups = 1
         self.groups = groups
         p = autopad(k, p)
         # decreases complexity, the idea of grouped convolutions is that 
@@ -107,7 +120,8 @@ class ShuffledGroupedConv(nn.Module):
         # intra channel group correlation, 
         # use grouped convolution also for 1x1 convolutions (see ShuffleNet)
         # which are then called pointwise grouped convolutions
-        self.conv = nn.Conv2d(chi, cho, k, s, p, groups=groups, bias=bias)
+        self.conv = nn.Conv2d(chi, cho, k, s, p, 
+            dilation=dilation, groups=groups, bias=bias)
         # example forward pass: 
         # assume g=2 groups and 6 channels (=> n=3) 
         # 111222 (entries of the two groups are 1 and 2 respectively) 
@@ -123,14 +137,15 @@ class ShuffledGroupedConv(nn.Module):
 
     def forward(self, x):
         x = self.conv(x)
-        # x has g * n output channels with g beeing the number 
-        # of groups; to shuffel reshape to (g, n)
-        x = x.reshape(x.size(0), self.groups, 
-            int(self.cho / self.groups), x.size(-2), x.size(-1))
-        # then transpose in the (g, n) dimensions
-        x = torch.transpose(x, 1, 2)
-        # finally flatten dimension (g, n) => channels shuffled!
-        x = x.reshape(x.size(0), -1, x.size(-2), x.size(-1))
+        if self.groups != 1:
+            # x has g * n output channels with g beeing the number 
+            # of groups; to shuffel reshape to (g, n)
+            x = x.reshape(x.size(0), self.groups, 
+                int(self.cho / self.groups), x.size(-2), x.size(-1))
+            # then transpose in the (g, n) dimensions
+            x = torch.transpose(x, 1, 2)
+            # finally flatten dimension (g, n) => channels shuffled!
+            x = x.reshape(x.size(0), -1, x.size(-2), x.size(-1))
         return x 
 
 def test_conv(Conv, n=10, benchmark=False):

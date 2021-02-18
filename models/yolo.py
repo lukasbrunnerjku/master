@@ -1,6 +1,10 @@
 import math
 from pathlib import Path
 from copy import deepcopy
+import yaml
+import thop
+import time 
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -130,6 +134,7 @@ class Concat(nn.Module):
         self.d = dimension
 
     def forward(self, x):
+        #import pdb; pdb.set_trace()
         return torch.cat(x, self.d)
 
 class CrossConv(nn.Module):
@@ -221,11 +226,20 @@ def make_divisible(x, divisor):
     # Returns x evenly divisible by divisor
     return math.ceil(x / divisor) * divisor
 
-def parse_model(d, ch):  # model_dict, input channels
+def parse_model(d, ch, head: bool):  # model_dict, input channels, use heads?
     gd, gw = d['depth_multiple'], d['width_multiple']
     
-    layers, c2 = [], ch[-1]  # layers, ch out
-    for i, (f, n, m, args) in enumerate(d['backbone']):  # from, number, module, args
+    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    
+    if head:
+        print('Build Yolov5 Backbone + Head')
+        d = d['backbone'] + d['head']
+    else:
+        print('Build Yolov5 Backbone')
+        d = d['backbone']
+        
+    for i, (f, n, m, args) in enumerate(d):  
+        # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
             try:
@@ -255,11 +269,22 @@ def parse_model(d, ch):  # model_dict, input channels
             c2 = ch[f]
 
         m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args)
+        t = str(m)[8:-2].replace('__main__.', '')  # module type
+        np = sum([x.numel() for x in m_.parameters()])  # number params
+        # attach index, 'from' index, type, number params
+        m_.i, m_.f, m_.type, m_.np = i, f, t, np  
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
         if i == 0:
             ch = []
         ch.append(c2)
-    return nn.Sequential(*layers)
+    return nn.Sequential(*layers), sorted(save)
+
+def time_synchronized():
+    # pytorch-accurate time
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.time()
 
 def sparsity(model):
     # Return global model sparsity
@@ -321,7 +346,7 @@ def initialize_weights(model):
         elif t in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6]:
             m.inplace = True
             
-def model_info(model, verbose=False, img_size=640):
+def model_info(model, verbose=False, img_size=512):
     # Model information. img_size may be int or list, i.e. img_size=640 or img_size=[640, 320]
     n_p = sum(x.numel() for x in model.parameters())  # number parameters
     n_g = sum(x.numel() for x in model.parameters() if x.requires_grad)  # number gradients
@@ -333,10 +358,9 @@ def model_info(model, verbose=False, img_size=640):
                   (i, name, p.requires_grad, p.numel(), list(p.shape), p.mean(), p.std()))
 
     try:  # FLOPS
-        from thop import profile
         stride = int(model.stride.max()) if hasattr(model, 'stride') else 32
         img = torch.zeros((1, model.yaml.get('ch', 3), stride, stride), device=next(model.parameters()).device)  # input
-        flops = profile(deepcopy(model), inputs=(img,), verbose=False)[0] / 1E9 * 2  # stride GFLOPS
+        flops = thop.profile(deepcopy(model), inputs=(img,), verbose=False)[0] / 1E9 * 2  # stride GFLOPS
         img_size = img_size if isinstance(img_size, list) else [img_size, img_size]  # expand if int/float
         fs = ', %.1f GFLOPS' % (flops * img_size[0] / stride * img_size[1] / stride)  # 640x640 GFLOPS
     except (ImportError, Exception):
@@ -345,18 +369,52 @@ def model_info(model, verbose=False, img_size=640):
     print(f"Model Summary: {len(list(model.modules()))} layers, {n_p / 10**6:0.3}M parameters, {n_g / 10**6:0.3}M gradients{fs}")
 
 class Yolov5(nn.Module):
-    def __init__(self, cfg='models/yolov5s.yaml', ch=3):  # input channels
+    def __init__(self, cfg='models/yolov5s.yaml', ch=3, head=True):  
+        # yaml config file, input channels, head=False => backbone only!
         super().__init__()
-        import yaml  # for torch hub
         self.yaml_file = Path(cfg).name
         with open(cfg) as f:
             self.yaml = yaml.load(f, Loader=yaml.SafeLoader)  # model dict
-        self.model = parse_model(deepcopy(self.yaml), [ch])
+        self.model, self.save = parse_model(deepcopy(self.yaml), [ch], head=head)
         # Init weights, biases
         initialize_weights(self)
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, profile=False):
+        y, dt = [], []  # outputs
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                # from earlier layers
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]      
+
+            if profile:
+                # FLOPS
+                o = thop.profile(m, inputs=(x,), verbose=False)[0] / 1E9 * 2 
+                t = time_synchronized()
+                for _ in range(10):
+                    _ = m(x)
+                dt.append((time_synchronized() - t) * 100)
+                # FLOPS, Number of Parameters, Time (ms), Module Type
+                print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
+
+            x = m(x)  # run
+            y.append(x if m.i in self.save else None)  # save output
+
+        if profile:
+            print('%.1fms total' % sum(dt))
+        return x
+        
+    def info(self, verbose=False, img_size=640):  # print model information
+        model_info(self, verbose, img_size)
+        
+    def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
+        print('Fusing layers... ')
+        for m in self.model.modules():
+            if type(m) is Conv and hasattr(m, 'bn'):
+                m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
+                delattr(m, 'bn')  # remove batchnorm
+                m.forward = m.fuseforward  # update forward
+        self.info()
+        return self
 
 if __name__ == '__main__':
     # import sys
@@ -365,24 +423,129 @@ if __name__ == '__main__':
     for cfg in ['models/yolov5s.yaml', 'models/yolov5m.yaml', 
                 'models/yolov5l.yaml', 'models/yolov5x.yaml']:
         print(f'{10*"-"} {cfg} {10*"-"}')
-        yolo = Yolov5(cfg).cuda().eval()
+        yolo = Yolov5(cfg, head=True).cuda().eval()
         model_info(yolo)
 
-        x = torch.randn((16, 3, 512, 512), device='cuda')
-        y = yolo(x)
+        x = torch.randn((1, 3, 512, 512), device='cuda')
+        y = yolo(x, profile=False)
+        #y = yolo(x, profile=True)
         print(f'In/Out: {x.size()} --> {y.size()}')
 
     """
     ---------- models/yolov5s.yaml ----------
-    Model Summary: 164 layers, 4.21M parameters, 4.21M gradients, 11.0 GFLOPS
-    In/Out: torch.Size([16, 3, 512, 512]) --> torch.Size([16, 512, 16, 16])
+    Build Yolov5 Backbone + Head
+    Model Summary: 278 layers, 7.05M parameters, 7.05M gradients, 10.4 GFLOPS
+           0.5      3520       0.2ms Focus                                   
+           0.6     18560       0.1ms Conv                                    
+           0.6     18816       0.7ms C3                                      
+           0.6     73984       0.1ms Conv                                    
+           1.3    156928       1.4ms C3                                      
+           0.6    295424       0.1ms Conv                                    
+           1.3    625152       1.3ms C3                                      
+           0.6   1180672       0.2ms Conv                                    
+           0.3    656896       0.4ms SPP                                     
+           0.6   1182720       0.7ms C3                                      
+           0.1    131584       0.1ms Conv                                    
+           0.0         0       0.0ms torch.nn.modules.upsampling.Upsample    
+           0.0         0       0.0ms Concat                                  
+           0.7    361984       0.7ms C3                                      
+           0.1     33024       0.1ms Conv                                    
+           0.0         0       0.0ms torch.nn.modules.upsampling.Upsample    
+           0.0         0       0.0ms Concat                                  
+           0.7     90880       0.7ms C3                                      
+           0.3    147712       0.1ms Conv                                    
+           0.0         0       0.0ms Concat                                  
+           0.6    296448       0.7ms C3                                      
+           0.3    590336       0.2ms Conv                                    
+           0.0         0       0.0ms Concat                                  
+           0.6   1182720       0.7ms C3                                      
+    9.1ms total
+    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 512, 16, 16])
     ---------- models/yolov5m.yaml ----------
-    Model Summary: 236 layers, 12.4M parameters, 12.4M gradients, 33.5 GFLOPS
-    In/Out: torch.Size([16, 3, 512, 512]) --> torch.Size([16, 768, 16, 16])
+    Build Yolov5 Backbone + Head
+    Model Summary: 386 layers, 21.0M parameters, 21.0M gradients, 32.2 GFLOPS
+           0.7      5280       0.2ms Focus                                   
+           1.4     41664       0.2ms Conv                                    
+           2.1     65280       1.4ms C3                                      
+           1.4    166272       0.2ms Conv                                    
+           5.2    629760       2.2ms C3                                      
+           1.4    664320       0.2ms Conv                                    
+           5.1   2512896       2.5ms C3                                      
+           1.4   2655744       0.3ms Conv                                    
+           0.8   1476864       0.4ms SPP                                     
+           2.1   4134912       1.0ms C3                                      
+           0.2    295680       0.1ms Conv                                    
+           0.0         0       0.0ms torch.nn.modules.upsampling.Upsample    
+           0.0         0       0.0ms Concat                                  
+           2.4   1182720       1.0ms C3                                      
+           0.2     74112       0.1ms Conv                                    
+           0.0         0       0.0ms torch.nn.modules.upsampling.Upsample    
+           0.0         0       0.0ms Concat                                  
+           2.4    296448       1.0ms C3                                      
+           0.7    332160       0.2ms Conv                                    
+           0.0         0       0.0ms Concat                                  
+           2.1   1035264       1.0ms C3                                      
+           0.7   1327872       0.3ms Conv                                    
+           0.0         0       0.0ms Concat                                  
+           2.1   4134912       1.0ms C3                                      
+    13.7ms total
+    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 768, 16, 16])
     ---------- models/yolov5l.yaml ----------
-    Model Summary: 308 layers, 27.1M parameters, 27.1M gradients, 75.9 GFLOPS
-    In/Out: torch.Size([16, 3, 512, 512]) --> torch.Size([16, 1024, 16, 16])
+    Build Yolov5 Backbone + Head
+    Model Summary: 494 layers, 46.6M parameters, 46.6M gradients, 73.0 GFLOPS
+           0.9      7040       0.3ms Focus                                   
+           2.4     73984       0.3ms Conv                                    
+           5.1    156928       1.5ms C3                                      
+           2.4    295424       0.3ms Conv                                    
+          13.2   1611264       2.9ms C3                                      
+           2.4   1180672       0.3ms Conv                                    
+          13.2   6433792       3.0ms C3                                      
+           2.4   4720640       0.4ms Conv                                    
+           1.3   2624512       0.4ms SPP                                     
+           5.1   9971712       1.2ms C3                                      
+           0.3    525312       0.1ms Conv                                    
+           0.0         0       0.0ms torch.nn.modules.upsampling.Upsample    
+           0.0         0       0.0ms Concat                                  
+           5.6   2757632       1.3ms C3                                      
+           0.3    131584       0.1ms Conv                                    
+           0.0         0       0.0ms torch.nn.modules.upsampling.Upsample    
+           0.0         0       0.0ms Concat                                  
+           5.7    690688       1.3ms C3                                      
+           1.2    590336       0.3ms Conv                                    
+           0.0         0       0.0ms Concat                                  
+           5.1   2495488       1.3ms C3                                      
+           1.2   2360320       0.3ms Conv                                    
+           0.0         0       0.0ms Concat                                  
+           5.1   9971712       1.3ms C3                                      
+    16.9ms total
+    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 1024, 16, 16])
     ---------- models/yolov5x.yaml ----------
-    Model Summary: 380 layers, 50.3M parameters, 50.3M gradients, 144.3 GFLOPS
-    In/Out: torch.Size([16, 3, 512, 512]) --> torch.Size([16, 1280, 16, 16])
+    Build Yolov5 Backbone + Head
+    Model Summary: 602 layers, 87.2M parameters, 87.2M gradients, 139.0 GFLOPS
+           1.2      8800       0.3ms Focus                                   
+           3.8    115520       0.4ms Conv                                    
+          10.1    309120       1.7ms C3                                      
+           3.8    461440       0.3ms Conv                                    
+          26.9   3285760       3.9ms C3                                      
+           3.8   1844480       0.3ms Conv                                    
+          26.9  13125120       3.7ms C3                                      
+           3.8   7375360       0.5ms Conv                                    
+           2.1   4099840       0.4ms SPP                                     
+          10.1  19676160       1.5ms C3                                      
+           0.4    820480       0.1ms Conv                                    
+           0.0         0       0.0ms torch.nn.modules.upsampling.Upsample    
+           0.0         0       0.0ms Concat                                  
+          10.9   5332480       1.5ms C3                                      
+           0.4    205440       0.1ms Conv                                    
+           0.0         0       0.0ms torch.nn.modules.upsampling.Upsample    
+           0.0         0       0.0ms Concat                                  
+          10.9   1335040       1.5ms C3                                      
+           1.9    922240       0.3ms Conv                                    
+           0.0         0       0.0ms Concat                                  
+          10.1   4922880       1.5ms C3                                      
+           1.9   3687680       0.4ms Conv                                    
+           0.0         0       0.0ms Concat                                  
+          10.1  19676160       1.5ms C3                                      
+    20.4ms total
+    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 1280, 16, 16])
     """
