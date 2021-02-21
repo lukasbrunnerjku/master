@@ -7,40 +7,13 @@ import math
 import sys
 
 sys.path.append('./')
-from utils import count_params, autopad 
-from convolutions import (DeformConv, SpatiallyConv, 
-    DepthwiseConv, FlattenedConv, GroupedConv, ShuffledGroupedConv)
-
-BASE = ShuffledGroupedConv
-GROUPS = 8
-
-#TODO ReLU inplace! look at yolov5
-class Conv(nn.Module):
-    def __init__(self, chi, cho, k=1, s=1, p=None, d=1, g=GROUPS, act=nn.ReLU(), affine=True):  
-        super().__init__()
-        self.conv = BASE(chi, cho, k, s, autopad(k, p), 
-            dilation=d, groups=g, bias=False)
-        self.bn = nn.BatchNorm2d(cho, affine=affine)
-        self.act = act
-
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
-    
-    def fuse_forward(self, x):  # TODO
-        return self.act(self.conv(x))
-
-class UpSample(nn.Module):
-    def __init__(self, chi, cho, k=1, s=3, p=None, d=1, g=GROUPS, sf=2):
-        super().__init__() 
-        # learned upsampling, avoids checkerboard artifacts
-        self.sf = sf
-        self.conv = Conv(chi, cho, k, s, p, d=d, g=g)
-    
-    def forward(self, x):
-        return self.conv(F.interpolate(x, scale_factor=self.sf, mode='nearest'))
+from utils import (initialize_weights, model_info, time_synchronized, 
+    profile, init_torch_seeds) 
+from convs import Conv#, Upsample
+import convs  
 
 class Bottleneck(nn.Module):
-    def __init__(self, chi, cho, k=3, s=1, p=None, d=1, g=GROUPS, e=0.5):
+    def __init__(self, chi, cho, k=3, s=1, p=None, d=1, g=convs.GROUPS, e=0.5):
         super().__init__()
         chh = int(cho * e)
         self.conv1 = Conv(chi, chh, 1, 1, 0, d=d, g=g)
@@ -54,7 +27,7 @@ class Bottleneck(nn.Module):
         return self.relu(residual + self.conv3(self.conv2(self.conv1(x))))
     
 class BasicBlock(nn.Module):
-    def __init__(self, chi, cho, k=3, s=1, p=None, d=1, g=GROUPS):
+    def __init__(self, chi, cho, k=3, s=1, p=None, d=1, g=convs.GROUPS):
         super().__init__()
         self.conv1 = Conv(chi, cho, k, s, p=d, d=d, g=g)
         self.conv2 = Conv(cho, cho, k, 1, p=d, d=d, g=g, act=nn.Identity())
@@ -143,9 +116,11 @@ class DLA(nn.Module):
         self.level5 = Tree(levels[5], block, channels[4], channels[5], 2,
             level_root=True, root_residual=residual_root)
 
+        """
         self.avgpool = nn.AvgPool2d(pool_size)
         self.fc = nn.Conv2d(channels[-1], num_classes, kernel_size=1,
             stride=1, padding=0, bias=True)
+        """
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -171,12 +146,14 @@ class DLA(nn.Module):
             y.append(x)
         if self.return_levels:
             return y
+        """
         else:
             x = self.avgpool(x)
             x = self.fc(x)
             x = x.view(x.size(0), -1)
             return x
-        
+        """
+
 def dla34(**kwargs):  # DLA-34
     model = DLA([1, 1, 1, 2, 2, 1],
                 [16, 32, 64, 128, 256, 512],
@@ -215,12 +192,19 @@ class IDAUp(nn.Module):
             if f == 1:
                 up = nn.Identity()
             else:
+                """ TODO swap with transposed
+                up = UpSample(out_dim, out_dim, k=3, 
+                    s=1, p=None, d=1, g=out_dim, sf=2)
+                """
+                #""
                 up = nn.ConvTranspose2d(
                     out_dim, out_dim, f * 2, stride=f, padding=f // 2,
                     output_padding=0, groups=out_dim, bias=False)
                 fill_up_weights(up)
+                #"""
             setattr(self, 'proj_' + str(i), proj)
             setattr(self, 'up_' + str(i), up)
+            
 
         for i in range(1, len(channels)):
             node = Conv(out_dim * 2, out_dim, k=node_k, s=1)
@@ -317,68 +301,110 @@ class DLASeg(nn.Module):
         for head in self.heads:
             ret[head] = self.__getattr__(head)(x)
         return ret
+    
+    def fuse(self):  # fuse Conv2d() + BatchNorm2d() layers
+        # used to speed up inference
+        print('Fusing layers... ')
+        self.eval()  # MUST BE in eval mode to work!
+        for m in self.children():
+            if type(m) is Conv and hasattr(m, 'bn'):
+                m.fuse()
+        self.info()
+        return self
+    
+    def info(self, verbose=False, img_size=512):  # print model information
+        model_info(self, verbose, img_size)
 
 def centernet(heads, num_layers=34, head_conv=256, down_ratio=4):
     # example: object detection
     # heads = {'cpt_hm': num_classes, 'cpt_off': 2, 'wh': 2}
     model = DLASeg('dla{}'.format(num_layers), heads,
         down_ratio=down_ratio, head_conv=head_conv)
+    initialize_weights(model)  # TODO: try different versions!
     return model
 
-
 if __name__ == '__main__':
-    model = centernet(heads={'cpt_hm': 30, 'cpt_off': 2, 'wh': 2})
-    print(f'BASE: {BASE.__name__}, GROUPS: {GROUPS}')
-    print(f'Parameters: {count_params(model) / 10**6:0.3}M')
-    assert torch.cuda.is_available()
-    model.cuda()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    def print_structure(model):
+        for m in model.children():
+            print(m)
+    # print_structure(centernet(heads={'cpt_hm': 30, 'cpt_off': 2, 'wh': 2}))
     
-    model.eval()
-    x = torch.randn(1, 3, 512, 512).cuda()
-    n = 10  # average over 'n' runs
-    with torch.no_grad():
-        start.record()
-        for _ in range(n):
-            out = model(x)
-        end.record()
-    torch.cuda.synchronize()
+    from convs import (DeformConv, SpatiallyConv, 
+        DepthwiseConv, FlattenedConv, GroupedConv, ShuffledGroupedConv)
     
-    print(f'Elapsed forward time (inference): {start.elapsed_time(end) / n:.3f}ms')
-    
-    print(f'In: {x.size()}')
-    for head_key, head in out.items():
-        print(f'{head_key} Out: {head.size()}')
+    for Base in [nn.Conv2d, DeformConv, SpatiallyConv, 
+        DepthwiseConv, FlattenedConv, GroupedConv, ShuffledGroupedConv]:
         
-    """ In: torch.Size([1, 3, 512, 512])
+        # change 'BASE' class for 'Conv' wrapper class
+        convs.BASE = Base
+        if 'group' in Base.__name__.lower():
+            convs.GROUPS = 8
+        else:
+            convs.GROUPS = 1
+            
+        print(f'BASE: {convs.BASE.__name__}, GROUPS: {convs.GROUPS}')
+        model = centernet(heads={'cpt_hm': 30, 'cpt_off': 2, 'wh': 2})
+        model.info()  # summary
+        profile(model)  # timing
+        model.fuse()  # fuse and print summary again
+        profile(model)  # fuse timing
+        
+    """
     BASE: Conv2d, GROUPS: 1
-    Parameters: 18.5M
-    Elapsed forward time (inference): 28.570ms
-
+    Model Summary: 260 layers, 17.9M parameters, 17.9M gradients, 62.1 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 11.256ms (cuda)
+    Fusing layers... 
+    Model Summary: 260 layers, 17.9M parameters, 17.9M gradients, 62.1 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 9.059ms (cuda)
     BASE: DeformConv, GROUPS: 1
-    Parameters: 19.5M
-    Elapsed forward time (inference): 37.897ms
-
+    Model Summary: 362 layers, 19.0M parameters, 19.0M gradients, 30.6 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 21.216ms (cuda)
+    Fusing layers... 
+    Model Summary: 362 layers, 19.0M parameters, 19.0M gradients, 30.6 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 21.092ms (cuda)
     BASE: SpatiallyConv, GROUPS: 1
-    Parameters: 17.1M
-    Elapsed forward time (inference): 35.122ms
-
+    Model Summary: 362 layers, 16.6M parameters, 16.6M gradients, 58.4 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 13.352ms (cuda)
+    Fusing layers... 
+    Model Summary: 362 layers, 16.6M parameters, 16.6M gradients, 58.4 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 13.554ms (cuda)
     BASE: DepthwiseConv, GROUPS: 1
-    Parameters: 4.38M
-    Elapsed forward time (inference): 29.335ms
-
+    Model Summary: 362 layers, 3.88M parameters, 3.88M gradients, 23.4 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 13.474ms (cuda)
+    Fusing layers... 
+    Model Summary: 362 layers, 3.88M parameters, 3.88M gradients, 23.4 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 13.212ms (cuda)
     BASE: FlattenedConv, GROUPS: 1
-    Parameters: 4.38M
-    Elapsed forward time (inference): 33.086ms
-
+    Model Summary: 413 layers, 3.86M parameters, 3.86M gradients, 24.4 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 16.829ms (cuda)
+    Fusing layers... 
+    Model Summary: 413 layers, 3.86M parameters, 3.86M gradients, 24.4 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 16.924ms (cuda)
     BASE: GroupedConv, GROUPS: 8
-    Parameters: 3.18M
-    Elapsed forward time (inference): 32.019ms
-
+    Model Summary: 311 layers, 17.9M parameters, 17.9M gradients, 62.1 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 11.013ms (cuda)
+    Fusing layers... 
+    Model Summary: 311 layers, 17.9M parameters, 17.9M gradients, 62.1 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 10.997ms (cuda)
     BASE: ShuffledGroupedConv, GROUPS: 8
-    Parameters: 3.18M
-    Elapsed forward time (inference): 34.249ms
+    Model Summary: 311 layers, 17.9M parameters, 17.9M gradients, 62.1 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 10.940ms (cuda)
+    Fusing layers... 
+    Model Summary: 311 layers, 17.9M parameters, 17.9M gradients, 62.1 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    Forward time: 10.852ms (cuda)
     """
     

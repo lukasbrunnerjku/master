@@ -1,0 +1,47 @@
+when GPU server processes with little memory usage are running
+they will still block GPU since no one not even the one who 
+initially launched the process can run on this GPU anymore,
+in that case kill the process with: >> ps
+this will show all running processes and their process id (PID)
+with >> kill -9 PID (or process name) it will be killed
+
+to get detailed cuda errors:
+CUDA_LAUNCH_BLOCKING=1 python myscript.py
+export CUDA_LAUNCH_BLOCKING=1
+or debug on CPU for useful error messages!
+
+with affine=False we won't learn mean and variance shift
+thus we aim at always normalizing to zero mean, unit variance activations
+bn = nn.BatchNorm2d(64, affine=False)
+
+performance guide: https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+try out torch.backends.cudnn.benchmark = True for possibly more efficient algorithms
+pin_memory=True for DataLoader to increase speed when transfering to GPU
+verison >=1.7 use optimizer.zero_grad(set_to_none=True) will set grads to None
+for Pointwise operations (elementwise addition, multiplication, math functions)
+use @torch.jit.script decorator for function with many pointwise operations, 
+this won't spawn multiple kernels (memory copy overhead)
+avoid unnecessary CPU-GPU synchronization with calls like: print(cuda_tensor),
+cuda_tensor.item(), memory copies: tensor.cuda(), cuda_tensor.cpu(), 
+instead create tensors directly on the target device e.g. 
+torch.rand(size, device=torch.device('cuda'))
+
+cuda guide: https://pytorch.org/docs/stable/notes/cuda.html
+get memory consumption currently or max peak since start of script with:
+torch.cuda.memory_allocated(device) or
+torch.cuda.max_memory_allocated(device)
+to allow TF32 mode on matmul, cuDNN, these flags default to True,
+normally we operate on 32FP with 1bit sign, 8 exponent, 23 mantissa
+with TF32 mode we do operation with 1bit sign, 8 exponent, 10 mantissa
+torch.backends.cuda.matmul.allow_tf32 = True and
+torch.backends.cudnn.allow_tf32 = True
+note: on NVIDIA GPUs since Ampere architecture (V100 has only Volta)
+NVIDIA shown similar performance for FP32 an TF32 trained networks!
+
+torch.backends.cudnn.benchmark = True
+will select optimal algorithm depending on input size,
+for varying input sizes (e.g. inference) this will 
+eventually slow down code when kept with non default value True,
+still we can use scaling and padding to keep resolution for inference,
+but when set to True the first runs will be slower since different
+algorithms are tested, thus make dry runs before performance measure
