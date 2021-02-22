@@ -5,26 +5,30 @@ from torchvision import models
 import sys
 
 sys.path.append('./')
-from utils import count_params
 from yolo import Yolov5
 from ghostnet import ghostnet
 
-def get_backbone(model_class, pretrained=False):
-    name = model_class.__name__
+def get_backbone(model_builder, pretrained=False):
+    # model_builder ... either class or function
+    name = model_builder.__name__
     if 'resnet' in name:
-        model = model_class(pretrained=pretrained)
+        model = model_builder(pretrained=pretrained)
         modules = list(model.children())[:-2]
         backbone = nn.Sequential(*modules)
     elif 'vgg' in name:
-        backbone = model_class(pretrained=pretrained).features
-    elif ('shufflenet' in name) or ('mobilenet' in name):
-        model = model_class(pretrained=pretrained)
+        backbone = model_builder(pretrained=pretrained).features
+    elif 'shufflenet' in name:
+        model = model_builder(pretrained=pretrained)
+        modules = list(model.children())[:-1]
+        backbone = nn.Sequential(*modules)
+    elif 'mobilenet' in name:
+        model = model_builder(pretrained=pretrained)
         modules = list(model.children())[:-1]
         backbone = nn.Sequential(*modules)
     elif name == 'Yolov5':
-        backbone = model_class()
+        backbone = model_builder()
     elif name.lower() == 'ghostnet':
-        model = model_class()
+        model = model_builder()
         modules = list(model.children())[:-4]
         backbone = nn.Sequential(*modules)
     else:
@@ -34,81 +38,16 @@ def get_backbone(model_class, pretrained=False):
     backbone.eval()
     out = backbone(x)  # b x c x h x w
     backbone.out_channels = out.size(1)  
-    return backbone
-
-def analyze_model(model_class, n=10, benchmark=False):
-    torch.manual_seed(1234)
-    rng_state = torch.get_rng_state()
-    
-    # will select optimal algorithm depending on input size,
-    # note: for varying input sizes (inference) this will 
-    # eventually slow down code when kept with non default value True
-    # (still can use scaling and padding to keep resolution for inference)
-    if benchmark:
-        # when set to True the first run will be slower since different
-        # algorithms are tested, thus run here once
-        torch.backends.cudnn.benchmark = True
-        
-    print(f'{10*"-"} {model_class.__name__} {10*"-"}')
-    model = get_backbone(model_class, pretrained=False)
-    
-    print(f'Parameters: {count_params(model) / 10**6:0.3}M')
-    assert torch.cuda.is_available()
-    model.cuda()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    
-    model.eval()
-    x = torch.randn(1, 3, 512, 512).cuda()
-    with torch.no_grad():
-        start.record()
-        for _ in range(n):
-            out = model(x)
-        end.record()
-    torch.cuda.synchronize()
-    print(f'Elapsed forward time (inference): {start.elapsed_time(end) / n:.3f}ms')
-    print(f'In/Out: {x.size()} --> {out.size()}')
-    print(f'Down ratio: {x.size(-1) / out.size(-1)}')
-
-    x = torch.randn(16, 3, 512, 512).cuda()
-    out = model(x)
-    y = torch.randn_like(out)
-    
-    model.train()
-    optimizer = optim.Adam(model.parameters())
-    loss_fn = nn.MSELoss()
-    
-    start.record()
-    for _ in range(n):
-        #optimizer.zero_grad(set_to_none=True)  # version >=1.7
-        for param in model.parameters():
-            param.grad = None
-        out = model(x)
-        loss = loss_fn(out, y)
-        loss.backward()
-        optimizer.step()
-    end.record()
-    torch.cuda.synchronize()
-    print(f'Elapsed forward + backward time: {start.elapsed_time(end) / n:.3f}ms')
-    
-    if benchmark:  # reset to default
-        torch.backends.cudnn.benchmark = False
-    
-    # reset RNG to have same input over test runs
-    torch.set_rng_state(rng_state)
-    
-def dry_run(model, n=10):
-    assert torch.cuda.is_available()
-    model.cuda()
-    model.eval()
-    for _ in range(n):
-        x = torch.randn(1, 3, 512, 512).cuda()
-        _ = model(x)
+    return backbone  
     
 def main():
+    from utils import (init_torch_seeds, model_info, profile, 
+        profile_training)
+    
+    init_torch_seeds(seed=1234)
+    
     # analyze backbone characterstics of different models
-    model_classes = [
+    model_builders = [
         models.resnet18, 
         models.resnet50,  
         models.vgg16, 
@@ -118,56 +57,118 @@ def main():
         ghostnet,
     ]
     
-    # without a dry run model performance of first model would be 
-    # significantly worse and not compareable!
-    dry_run(model_classes[0]())
-    
-    for model_class in model_classes:
-        analyze_model(model_class)
+    for model_builder in model_builders:
+        print(f'{10*"-"} {model_builder.__name__} {10*"-"}')
+        model = get_backbone(model_builder, pretrained=False)
+        model_info(model, verbose=False, img_size=512) 
+        profile(model, verbose=True)
+        profile_training(model)
     
     '''
+    PyTorch version 1.6.0
+    CUDA version 10.2
+    cuDNN version 7605
+    cuDNN deterministic False
+    cuDNN benchmark True
     ---------- resnet18 ----------
-    Parameters: 11.2M
-    Elapsed forward time (inference): 2.346ms
-    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 512, 16, 16])
-    Down ratio: 32.0
-    Elapsed forward + backward time: 74.531ms
+    Model Summary: 66 layers, 11.2M parameters, 11.2M gradients, 19.0 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    benchmark warm up...
+    Forward time: 2.913ms (cuda)
+    output: torch.Size([1, 512, 16, 16])
+    Input size: torch.Size([16, 3, 512, 512])
+    benchmark warm up forward...
+    benchmark warm up backward...
+    run through forward pass for 100 runs...
+    run through forward and backward pass for 100 runs...
+    Forward time: 18.971ms (cuda)
+    Backward time: 48.689ms (cuda)
+    Maximum of managed memory: 4.049600512GB
     ---------- resnet50 ----------
-    Parameters: 23.5M
-    Elapsed forward time (inference): 6.409ms
-    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 2048, 16, 16])
-    Down ratio: 32.0
-    Elapsed forward + backward time: 307.028ms
+    Model Summary: 149 layers, 23.5M parameters, 23.5M gradients, 42.9 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    benchmark warm up...
+    Forward time: 7.414ms (cuda)
+    output: torch.Size([1, 2048, 16, 16])
+    Input size: torch.Size([16, 3, 512, 512])
+    benchmark warm up forward...
+    benchmark warm up backward...
+    run through forward pass for 100 runs...
+    run through forward and backward pass for 100 runs...
+    Forward time: 70.931ms (cuda)
+    Backward time: 152.753ms (cuda)
+    Maximum of managed memory: 14.621343744GB
     ---------- vgg16 ----------
-    Parameters: 14.7M
-    Elapsed forward time (inference): 8.864ms
-    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 512, 16, 16])
-    Down ratio: 32.0
-    Elapsed forward + backward time: 483.552ms
+    Model Summary: 32 layers, 14.7M parameters, 14.7M gradients, 160.5 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    benchmark warm up...
+    Forward time: 8.386ms (cuda)
+    output: torch.Size([1, 512, 16, 16])
+    Input size: torch.Size([16, 3, 512, 512])
+    benchmark warm up forward...
+    benchmark warm up backward...
+    run through forward pass for 100 runs...
+    run through forward and backward pass for 100 runs...
+    Forward time: 103.586ms (cuda)
+    Backward time: 274.922ms (cuda)
+    Maximum of managed memory: 14.66957824GB
     ---------- shufflenet_v2_x2_0 ----------
-    Parameters: 5.34M
-    Elapsed forward time (inference): 8.893ms
-    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 2048, 16, 16])
-    Down ratio: 32.0
-    Elapsed forward + backward time: 133.615ms
+    Model Summary: 204 layers, 5.34M parameters, 5.34M gradients, 6.2 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    benchmark warm up...
+    Forward time: 9.068ms (cuda)
+    output: torch.Size([1, 2048, 16, 16])
+    Input size: torch.Size([16, 3, 512, 512])
+    benchmark warm up forward...
+    benchmark warm up backward...
+    run through forward pass for 100 runs...
+    run through forward and backward pass for 100 runs...
+    Forward time: 21.453ms (cuda)
+    Backward time: 46.293ms (cuda)
+    Maximum of managed memory: 7.304380416GB
     ---------- mobilenet_v2 ----------
-    Parameters: 2.22M
-    Elapsed forward time (inference): 6.694ms
-    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 1280, 16, 16])
-    Down ratio: 32.0
-    Elapsed forward + backward time: 94.504ms
+    Model Summary: 210 layers, 2.22M parameters, 2.22M gradients, 3.3 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    benchmark warm up...
+    Forward time: 6.598ms (cuda)
+    output: torch.Size([1, 1280, 16, 16])
+    Input size: torch.Size([16, 3, 512, 512])
+    benchmark warm up forward...
+    benchmark warm up backward...
+    run through forward pass for 100 runs...
+    run through forward and backward pass for 100 runs...
+    Forward time: 24.545ms (cuda)
+    Backward time: 61.306ms (cuda)
+    Maximum of managed memory: 9.284091904GB
     ---------- Yolov5 ----------
-    Parameters: 4.21M
-    Elapsed forward time (inference): 4.686ms
-    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 512, 16, 16])
-    Down ratio: 32.0
-    Elapsed forward + backward time: 61.813ms
+    Build Yolov5 Backbone + Head
+    Model Summary: 278 layers, 7.05M parameters, 7.05M gradients, 10.4 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    benchmark warm up...
+    Forward time: 9.292ms (cuda)
+    output: torch.Size([1, 512, 16, 16])
+    Input size: torch.Size([16, 3, 512, 512])
+    benchmark warm up forward...
+    benchmark warm up backward...
+    run through forward pass for 100 runs...
+    run through forward and backward pass for 100 runs...
+    Forward time: 20.856ms (cuda)
+    Backward time: 46.989ms (cuda)
+    Maximum of managed memory: 5.125439488GB
     ---------- ghostnet ----------
-    Parameters: 2.67M
-    Elapsed forward time (inference): 12.548ms
-    In/Out: torch.Size([1, 3, 512, 512]) --> torch.Size([1, 960, 16, 16])
-    Down ratio: 32.0
-    Elapsed forward + backward time: 110.154ms
+    Model Summary: 402 layers, 2.67M parameters, 2.67M gradients, 1.5 GFLOPs
+    Input size: torch.Size([1, 3, 512, 512])
+    benchmark warm up...
+    Forward time: 14.874ms (cuda)
+    output: torch.Size([1, 960, 16, 16])
+    Input size: torch.Size([16, 3, 512, 512])
+    benchmark warm up forward...
+    benchmark warm up backward...
+    run through forward pass for 100 runs...
+    run through forward and backward pass for 100 runs...
+    Forward time: 22.233ms (cuda)
+    Backward time: 67.145ms (cuda)
+    Maximum of managed memory: 6.876561408GB
     '''
 
 if __name__ == '__main__':

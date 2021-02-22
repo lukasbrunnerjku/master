@@ -48,7 +48,11 @@ def time_synchronized():
     # pytorch-accurate time
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    return time.time()
+    return time.time()  # seconds
+
+def print_structure(model):
+    for m in model.children():
+        print(m)
 
 def profile(model, device='cuda', img_size=512, nruns=100, verbose=False):
     x = torch.randn(1, 3, img_size, img_size)
@@ -56,36 +60,95 @@ def profile(model, device='cuda', img_size=512, nruns=100, verbose=False):
 
     if torch.cuda.is_available() and 'cuda' in device: 
         model.cuda().eval()
-
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
         x = x.cuda()
 
-        start.record()
+        if torch.backends.cudnn.benchmark:
+            # have to do warm up iterations for fair comparison
+            print('benchmark warm up...')
+            for _ in range(50):
+                _ = model(x)
+        
+        start = time_synchronized()
         for _ in range(nruns):
-            out = model(x)
-        end.record()
-        torch.cuda.synchronize()
-        print(f'Forward time: {start.elapsed_time(end) / nruns:.3f}ms (cuda)')
+            o = model(x)
+        end = time_synchronized()
+        print(f'Forward time: {(end - start) * 1000 / nruns:.3f}ms (cuda)')
     else:
         model.cpu().eval()
         start = time_synchronized()
         for _ in range(nruns):
-            out = model(x)
+            o = model(x)
         end = time_synchronized()  # seconds
-        print(f'Forward time: {(end - start) / 1000 / nruns:.3f}ms (cpu)')
+        print(f'Forward time: {(end - start) * 1000 / nruns:.3f}ms (cpu)')
     
     if verbose:
-        if isinstance(out, dict):
-            for head_key, head in out.items():
+        if isinstance(o, dict):
+            for head_key, head in o.items():
                 print(f'{head_key} output: {head.size()}')
-        elif isinstance(out, list) or isinstance(out, tuple):
+        elif isinstance(o, list) or isinstance(o, tuple):
             print('output:', end=' ')
-            for head in out:
+            for head in o:
                 print(head.size(), end=', ')
             print('')
         else:
-            print('output:', out.size())
+            print('output:', o.size())
+            
+def profile_training(model, img_size=512, nruns=100):
+    x = torch.randn(16, 3, img_size, img_size)
+    print(f'Input size: {x.size()}')
+
+    assert torch.cuda.is_available()
+    model.cuda().train()
+    x = x.cuda()
+    
+    o = model(x)
+    if isinstance(o, list) or isinstance(o, tuple):
+        g0 = [torch.rand_like(item) for item in o]
+    elif isinstance(o, dict):
+        g0 = [torch.rand_like(item) for item in o.values()]
+    else:
+        g0 = [torch.rand_like(o)]
+    
+    if torch.backends.cudnn.benchmark:
+        # have to do warm up iterations for fair comparison
+        print('benchmark warm up forward...')
+        for _ in range(50):
+            o = model(x)
+
+        print('benchmark warm up backward...')
+        for _ in range(50):
+            o = model(x)
+            for param in model.parameters():
+                param.grad = None
+            o = o.values() if isinstance(o, dict) else ([o] if isinstance(o, torch.Tensor) else o)         
+            for i, v in enumerate(o):
+                v.backward(g0[i], retain_graph=i < len(o) - 1)
+
+    print(f'run through forward pass for {nruns} runs...')
+    start = time_synchronized()
+    for _ in range(nruns):
+        o = model(x)
+    end = time_synchronized()
+    fwd_time = end - start  # fwd only
+    
+    print(f'run through forward and backward pass for {nruns} runs...')
+    torch.cuda.reset_peak_memory_stats(device='cuda')
+    start = time_synchronized()
+    for _ in range(nruns):
+        o = model(x)
+        for param in model.parameters():
+            param.grad = None
+        o = o.values() if isinstance(o, dict) else ([o] if isinstance(o, torch.Tensor) else o)          
+        for i, v in enumerate(o):
+            v.backward(g0[i], retain_graph=i < len(o) - 1)
+    end = time_synchronized()
+    mem = torch.cuda.max_memory_reserved(device='cuda')  # bytes
+    bwd_time = end - start  # fwd + bwd
+    bwd_time = (bwd_time - fwd_time)  # bwd only
+
+    print(f'Forward time: {fwd_time * 1000 / nruns:.3f}ms (cuda)')
+    print(f'Backward time: {bwd_time * 1000 / nruns:.3f}ms (cuda)')
+    print(f'Maximum of managed memory: {mem / 10**9}GB')
 
 def sparsity(model):
     # Return global model sparsity
@@ -112,6 +175,12 @@ def init_torch_seeds(seed=0):
         cudnn.benchmark, cudnn.deterministic = False, True
     else:  # faster, less reproducible
         cudnn.benchmark, cudnn.deterministic = True, False
+        
+    print('PyTorch version {}'.format(torch.__version__))
+    print('CUDA version {}'.format(torch.version.cuda))
+    print('cuDNN version {}'.format(cudnn.version()))
+    print('cuDNN deterministic {}'.format(cudnn.deterministic))
+    print('cuDNN benchmark {}'.format(cudnn.benchmark))
 
 def initialize_weights(model):
     for m in model.modules():

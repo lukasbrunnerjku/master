@@ -7,7 +7,8 @@ from torchvision import ops
 import sys
 
 sys.path.append('./')
-from utils import count_params, autopad, fuse_conv_and_bn
+from utils import (count_params, autopad, fuse_conv_and_bn, 
+    time_synchronized)
 
 BASE = nn.Conv2d
 GROUPS = 1
@@ -48,9 +49,9 @@ class SpatiallyConv(nn.Module):
         s = s if isinstance(s, tuple) else (s, s)
         p = autopad(k, p)
         self.conv1 = nn.Conv2d(chi, chi, (k[0], 1), (s[0], 1), (p[0], 0), 
-            dilation=dilation, groups=1, bias=True)
+            dilation=dilation, groups=groups, bias=True)
         self.conv2 = nn.Conv2d(chi, cho, (1, k[1]), (1, s[1]), (0, p[1]), 
-            dilation=dilation, groups=1, bias=bias)
+            dilation=dilation, groups=groups, bias=bias)  
         
     def forward(self, x):
         return self.conv2(self.conv1(x))
@@ -187,7 +188,7 @@ class ShuffledGroupedConv(nn.Module):
         return self
     
 class Conv(nn.Module):
-    def __init__(self, chi, cho, k=1, s=1, p=None, d=1, g=GROUPS, act=nn.ReLU(), affine=True): 
+    def __init__(self, chi, cho, k=1, s=1, p=None, d=1, g=GROUPS, act=True, affine=True): 
         super().__init__()
         if chi % g != 0 or cho % g != 0:
             g = 1
@@ -195,7 +196,7 @@ class Conv(nn.Module):
         p = autopad(k, p)
         self.conv = BASE(chi, cho, k, s, p, dilation=d, groups=g, bias=False)
         self.bn = nn.BatchNorm2d(cho, affine=affine)
-        self.act = act
+        self.act = nn.ReLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
@@ -210,15 +211,6 @@ class Conv(nn.Module):
             self.conv = fuse_conv_and_bn(self.conv, self.bn)
         delattr(self, 'bn')  # remove batchnorm
         self.forward = self.fuseforward  # update forward
-
-class UpSample(nn.Module):
-    def __init__(self, chi, cho, k=1, s=3, p=None, d=1, g=GROUPS, sf=2):
-        super().__init__()  # avoids checkerboard artifacts
-        self.sf = sf
-        self.conv = Conv(chi, cho, k, s, p, d=d, g=g)
-    
-    def forward(self, x):
-        return self.conv(F.interpolate(x, scale_factor=self.sf, mode='nearest'))
 
 def test_conv(Base, nruns=100, device='cuda'):
     # will do basic sanity check, we want to get same spatial 
@@ -235,6 +227,12 @@ def test_conv(Base, nruns=100, device='cuda'):
         conv.cuda().train()
         conv_.cuda().train()
         x = x.cuda()
+        
+        if torch.backends.cudnn.benchmark:
+            # have to do warm up iterations for fair comparison
+            print('benchmark warm up...')
+            for _ in range(50):
+                _ = conv(x)
     else:
         conv.cpu().train()
         conv_.cpu().train()
@@ -242,35 +240,26 @@ def test_conv(Base, nruns=100, device='cuda'):
     
     p = count_params(conv)
     p_ = count_params(conv_)
-    
     # relative number of parameter change in brackets w.r.t. nn.conv2d
     print(f'Number of parameters: {p} ({p / p_ * 100:.2f}%)')
-    
-    optimizer = optim.Adam(conv.parameters())
-    
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
     
     # ensure same behaviour as standard module
     out = conv(x)
     out_ = conv_(x)
     assert out.shape == out_.shape, f'Shape missmatch, should be {out_.shape} but is {out.shape}'
     
+    # g0 = torch.randn_like(out)
     # performance test without feature/target loading
     # because that would require a significant amount of overhead
-    start.record()
+    start = time_synchronized()
     for _ in range(nruns):
-        #optimizer.zero_grad(set_to_none=True)  # version >=1.7
+        out = conv(x)
         for param in conv.parameters():
             param.grad = None
-        out = conv(x)
-        loss = out.mean()
-        loss.backward()
-        optimizer.step()
-    end.record()
-    torch.cuda.synchronize()
+        out.mean().backward()  # out.backward(g0)
+    end = time_synchronized()
     
-    print(f'Forward + Backward time: {start.elapsed_time(end) / nruns:.3f}ms')
+    print(f'Forward + Backward time: {(end - start) * 1000 / nruns:.3f}ms')
         
 def test_fuse(Module, nruns=10, device='cuda'):
     # Module has batchnorm and more bundled together
@@ -293,9 +282,7 @@ def test_fuse(Module, nruns=10, device='cuda'):
     
     # traing batchnorm and convolution: 
     for _ in range(nruns):
-        #optimizer.zero_grad(set_to_none=True)  # version >=1.7
-        for param in module.parameters():
-            param.grad = None
+        optimizer.zero_grad(set_to_none=True)  # version >=1.7
         out = module(x)
         loss = out.mean()
         loss.backward()
@@ -345,54 +332,57 @@ def main():
         #test_fuse(Conv, device='cuda')
     
 if __name__ == '__main__':
+    from utils import init_torch_seeds
+    
+    # init_torch_seeds(seed=1234)
     main()
     
     '''
     ----- on cpu  -----
     BASE: Conv2d, GROUPS: 1
     Number of parameters: 2336 (100.00%)
-    Forward + Backward time: 430.513ms
+    Forward + Backward time: 329.352ms
     BASE: DeformConv, GROUPS: 1
     Number of parameters: 3650 (156.25%)
-    Forward + Backward time: 55168.598ms
+    Forward + Backward time: 55058.459ms
     BASE: SpatiallyConv, GROUPS: 1
     Number of parameters: 1000 (42.81%)
-    Forward + Backward time: 594.914ms
+    Forward + Backward time: 574.737ms
     BASE: DepthwiseConv, GROUPS: 1
     Number of parameters: 368 (15.75%)
-    Forward + Backward time: 588.565ms
+    Forward + Backward time: 558.899ms
     BASE: FlattenedConv, GROUPS: 1
     Number of parameters: 544 (23.29%)
-    Forward + Backward time: 1785.229ms
+    Forward + Backward time: 1656.760ms
     BASE: GroupedConv, GROUPS: 8
     Number of parameters: 320 (13.70%)
-    Forward + Backward time: 635.854ms
+    Forward + Backward time: 585.382ms
     BASE: ShuffledGroupedConv, GROUPS: 8
     Number of parameters: 320 (13.70%)
-    Forward + Backward time: 736.562ms
+    Forward + Backward time: 682.220ms
     
     ----- on cuda -----
     BASE: Conv2d, GROUPS: 1
     Number of parameters: 2336 (100.00%)
-    Forward + Backward time: 8.858ms
+    Forward + Backward time: 8.753ms
     BASE: DeformConv, GROUPS: 1
     Number of parameters: 3650 (156.25%)
-    Forward + Backward time: 68.709ms
+    Forward + Backward time: 70.436ms
     BASE: SpatiallyConv, GROUPS: 1
     Number of parameters: 1000 (42.81%)
-    Forward + Backward time: 20.416ms
+    Forward + Backward time: 20.321ms
     BASE: DepthwiseConv, GROUPS: 1
     Number of parameters: 368 (15.75%)
-    Forward + Backward time: 23.521ms
+    Forward + Backward time: 23.472ms
     BASE: FlattenedConv, GROUPS: 1
     Number of parameters: 544 (23.29%)
-    Forward + Backward time: 40.786ms
+    Forward + Backward time: 40.704ms
     BASE: GroupedConv, GROUPS: 8
     Number of parameters: 320 (13.70%)
-    Forward + Backward time: 14.407ms
+    Forward + Backward time: 14.369ms
     BASE: ShuffledGroupedConv, GROUPS: 8
     Number of parameters: 320 (13.70%)
-    Forward + Backward time: 17.034ms
+    Forward + Backward time: 16.996ms
     
     fuse relative error: 0.00000030
     BASE: Conv2d, GROUPS: 1

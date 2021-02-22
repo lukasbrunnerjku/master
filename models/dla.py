@@ -8,9 +8,18 @@ import sys
 
 sys.path.append('./')
 from utils import (initialize_weights, model_info, time_synchronized, 
-    profile, init_torch_seeds) 
-from convs import Conv#, Upsample
+    profile, profile_training, init_torch_seeds) 
+from convs import Conv
 import convs  
+
+class UpSample(nn.Module):
+    def __init__(self, chi, cho, k=1, s=3, p=None, d=1, g=convs.GROUPS, sf=2):
+        super().__init__()  # avoids checkerboard artifacts
+        self.sf = sf
+        self.conv = Conv(chi, cho, k, s, p, d=d, g=g)
+    
+    def forward(self, x):
+        return self.conv(F.interpolate(x, scale_factor=self.sf, mode='nearest'))
 
 class Bottleneck(nn.Module):
     def __init__(self, chi, cho, k=3, s=1, p=None, d=1, g=convs.GROUPS, e=0.5):
@@ -18,7 +27,7 @@ class Bottleneck(nn.Module):
         chh = int(cho * e)
         self.conv1 = Conv(chi, chh, 1, 1, 0, d=d, g=g)
         self.conv2 = Conv(chh, chh, k, s, p=d, d=d, g=g)
-        self.conv3 = Conv(chh, cho, 1, 1, 0, d=d, g=g, act=nn.Identity())
+        self.conv3 = Conv(chh, cho, 1, 1, 0, d=d, g=g, act=False)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x, residual=None):
@@ -30,7 +39,7 @@ class BasicBlock(nn.Module):
     def __init__(self, chi, cho, k=3, s=1, p=None, d=1, g=convs.GROUPS):
         super().__init__()
         self.conv1 = Conv(chi, cho, k, s, p=d, d=d, g=g)
-        self.conv2 = Conv(cho, cho, k, 1, p=d, d=d, g=g, act=nn.Identity())
+        self.conv2 = Conv(cho, cho, k, 1, p=d, d=d, g=g, act=False)
         self.relu = nn.ReLU(inplace=True)
     
     def forward(self, x, residual=None):
@@ -41,7 +50,7 @@ class BasicBlock(nn.Module):
 class Root(nn.Module):
     def __init__(self, chi, cho, k, residual):
         super().__init__()
-        self.conv = Conv(chi, cho, 1, 1, act=nn.Identity())
+        self.conv = Conv(chi, cho, 1, 1, act=False)
         self.relu = nn.ReLU(inplace=True)
         self.residual = residual
 
@@ -79,7 +88,7 @@ class Tree(nn.Module):
         if s > 1:
             self.downsample = nn.MaxPool2d(s, stride=s)
         if chi != cho:
-            self.project = Conv(chi, cho, k=1, s=1, act=nn.Identity())
+            self.project = Conv(chi, cho, k=1, s=1, act=False)
                 
     def forward(self, x, residual=None, children=None):
         children = [] if children is None else children
@@ -116,12 +125,6 @@ class DLA(nn.Module):
         self.level5 = Tree(levels[5], block, channels[4], channels[5], 2,
             level_root=True, root_residual=residual_root)
 
-        """
-        self.avgpool = nn.AvgPool2d(pool_size)
-        self.fc = nn.Conv2d(channels[-1], num_classes, kernel_size=1,
-            stride=1, padding=0, bias=True)
-        """
-
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
@@ -146,13 +149,6 @@ class DLA(nn.Module):
             y.append(x)
         if self.return_levels:
             return y
-        """
-        else:
-            x = self.avgpool(x)
-            x = self.fc(x)
-            x = x.view(x.size(0), -1)
-            return x
-        """
 
 def dla34(**kwargs):  # DLA-34
     model = DLA([1, 1, 1, 2, 2, 1],
@@ -165,17 +161,6 @@ def dla60(**kwargs):  # DLA-60
                 [16, 32, 128, 256, 512, 1024],
                 block=Bottleneck, **kwargs)
     return model
-
-def fill_up_weights(up):
-    w = up.weight.data
-    f = math.ceil(w.size(2) / 2)
-    c = (2 * f - 1 - f % 2) / (2. * f)
-    for i in range(w.size(2)):
-        for j in range(w.size(3)):
-            w[0, 0, i, j] = \
-                (1 - math.fabs(i / f - c)) * (1 - math.fabs(j / f - c))
-    for c in range(1, w.size(0)):
-        w[c, 0, :, :] = w[0, 0, :, :]
 
 class IDAUp(nn.Module):
     def __init__(self, node_k, out_dim, channels, up_factors):
@@ -192,16 +177,9 @@ class IDAUp(nn.Module):
             if f == 1:
                 up = nn.Identity()
             else:
-                """ TODO swap with transposed
                 up = UpSample(out_dim, out_dim, k=3, 
                     s=1, p=None, d=1, g=out_dim, sf=2)
-                """
-                #""
-                up = nn.ConvTranspose2d(
-                    out_dim, out_dim, f * 2, stride=f, padding=f // 2,
-                    output_padding=0, groups=out_dim, bias=False)
-                fill_up_weights(up)
-                #"""
+
             setattr(self, 'proj_' + str(i), proj)
             setattr(self, 'up_' + str(i), up)
             
@@ -324,9 +302,9 @@ def centernet(heads, num_layers=34, head_conv=256, down_ratio=4):
     return model
 
 if __name__ == '__main__':
-    def print_structure(model):
-        for m in model.children():
-            print(m)
+    init_torch_seeds(seed=1234)
+    
+    # from convs import print_structure
     # print_structure(centernet(heads={'cpt_hm': 30, 'cpt_off': 2, 'wh': 2}))
     
     from convs import (DeformConv, SpatiallyConv, 
@@ -345,66 +323,90 @@ if __name__ == '__main__':
         print(f'BASE: {convs.BASE.__name__}, GROUPS: {convs.GROUPS}')
         model = centernet(heads={'cpt_hm': 30, 'cpt_off': 2, 'wh': 2})
         model.info()  # summary
-        profile(model)  # timing
-        model.fuse()  # fuse and print summary again
-        profile(model)  # fuse timing
         
+        try:
+            profile(model)  # timing
+            model.fuse()  # fuse and print summary again
+            profile(model)  # fuse timing
+            profile_training(model)  # forward + backward timing/memory
+        except Exception as e:
+            print(e)
+            
     """
+    PyTorch version 1.6.0
+    CUDA version 10.2
+    cuDNN version 7605
+    cuDNN deterministic False
+    cuDNN benchmark True
     BASE: Conv2d, GROUPS: 1
     Model Summary: 260 layers, 17.9M parameters, 17.9M gradients, 62.1 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 11.256ms (cuda)
+    benchmark warm up...
+    Forward time: 9.625ms (cuda)
     Fusing layers... 
     Model Summary: 260 layers, 17.9M parameters, 17.9M gradients, 62.1 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 9.059ms (cuda)
+    benchmark warm up...
+    Forward time: 9.121ms (cuda)
     BASE: DeformConv, GROUPS: 1
     Model Summary: 362 layers, 19.0M parameters, 19.0M gradients, 30.6 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 21.216ms (cuda)
+    benchmark warm up...
+    Forward time: 21.795ms (cuda)
     Fusing layers... 
     Model Summary: 362 layers, 19.0M parameters, 19.0M gradients, 30.6 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 21.092ms (cuda)
+    benchmark warm up...
+    Forward time: 21.822ms (cuda)
     BASE: SpatiallyConv, GROUPS: 1
     Model Summary: 362 layers, 16.6M parameters, 16.6M gradients, 58.4 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 13.352ms (cuda)
+    benchmark warm up...
+    Forward time: 13.423ms (cuda)
     Fusing layers... 
     Model Summary: 362 layers, 16.6M parameters, 16.6M gradients, 58.4 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 13.554ms (cuda)
+    benchmark warm up...
+    Forward time: 13.519ms (cuda)
     BASE: DepthwiseConv, GROUPS: 1
     Model Summary: 362 layers, 3.88M parameters, 3.88M gradients, 23.4 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 13.474ms (cuda)
+    benchmark warm up...
+    Forward time: 12.050ms (cuda)
     Fusing layers... 
     Model Summary: 362 layers, 3.88M parameters, 3.88M gradients, 23.4 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 13.212ms (cuda)
+    benchmark warm up...
+    Forward time: 11.684ms (cuda)
     BASE: FlattenedConv, GROUPS: 1
     Model Summary: 413 layers, 3.86M parameters, 3.86M gradients, 24.4 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 16.829ms (cuda)
+    benchmark warm up...
+    Forward time: 17.506ms (cuda)
     Fusing layers... 
     Model Summary: 413 layers, 3.86M parameters, 3.86M gradients, 24.4 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 16.924ms (cuda)
+    benchmark warm up...
+    Forward time: 17.178ms (cuda)
     BASE: GroupedConv, GROUPS: 8
     Model Summary: 311 layers, 17.9M parameters, 17.9M gradients, 62.1 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 11.013ms (cuda)
+    benchmark warm up...
+    Forward time: 11.208ms (cuda)
     Fusing layers... 
     Model Summary: 311 layers, 17.9M parameters, 17.9M gradients, 62.1 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 10.997ms (cuda)
+    benchmark warm up...
+    Forward time: 11.097ms (cuda)
     BASE: ShuffledGroupedConv, GROUPS: 8
     Model Summary: 311 layers, 17.9M parameters, 17.9M gradients, 62.1 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 10.940ms (cuda)
+    benchmark warm up...
+    Forward time: 9.485ms (cuda)
     Fusing layers... 
     Model Summary: 311 layers, 17.9M parameters, 17.9M gradients, 62.1 GFLOPs
     Input size: torch.Size([1, 3, 512, 512])
-    Forward time: 10.852ms (cuda)
+    benchmark warm up...
+    Forward time: 9.421ms (cuda)
     """
     

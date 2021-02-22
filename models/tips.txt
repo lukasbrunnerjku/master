@@ -1,3 +1,12 @@
+Also, once you pin a tensor or storage, you can use asynchronous GPU copies. 
+Just pass an additional non_blocking=True argument to a to() or a cuda() call. 
+This can be used to overlap data transfers with computation.
+You can make the DataLoader return batches placed in pinned memory by passing pin_memory=True to its constructor.
+
+avoid in-place operations since they can potentially overwrite values required 
+to compute gradients AND requires the implementation to rewrite the computational graph
+while out-of-place versions simply allocate new objects and keep references to the old graph!
+
 when GPU server processes with little memory usage are running
 they will still block GPU since no one not even the one who 
 initially launched the process can run on this GPU anymore,
