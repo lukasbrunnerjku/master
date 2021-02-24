@@ -6,11 +6,17 @@ import numpy as np
 import math
 import sys
 
-sys.path.append('./')
-from utils import (initialize_weights, model_info, time_synchronized, 
-    profile, profile_training, init_torch_seeds) 
-from convs import Conv
-import convs  
+try:
+    sys.path.append('./')
+    from utils import (initialize_weights, model_info, time_synchronized, 
+        profile, profile_training, init_torch_seeds) 
+    from convs import Conv
+    import convs
+except ImportError:
+    from .utils import (initialize_weights, model_info, time_synchronized, 
+        profile, profile_training, init_torch_seeds) 
+    from .convs import Conv
+    from . import convs  
 
 class UpSample(nn.Module):
     def __init__(self, chi, cho, k=1, s=3, p=None, d=1, g=convs.GROUPS, sf=2):

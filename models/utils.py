@@ -1,3 +1,4 @@
+import math
 import torch
 from torch import nn
 import numpy as np
@@ -5,6 +6,117 @@ import thop
 import time
 from copy import deepcopy
 from torchvision import ops
+from contextlib import contextmanager
+
+def clip_coords(boxes, img_shape):
+    # Clip bounding xyxy bounding boxes to image shape (height, width)
+    boxes[:, 0].clamp_(0, img_shape[1])  # x1
+    boxes[:, 1].clamp_(0, img_shape[0])  # y1
+    boxes[:, 2].clamp_(0, img_shape[1])  # x2
+    boxes[:, 3].clamp_(0, img_shape[0])  # y2
+
+
+def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-9):
+    # Returns the IoU of box1 to box2. box1 is 4, box2 is nx4
+    box2 = box2.T
+
+    # Get the coordinates of bounding boxes
+    if x1y1x2y2:  # x1, y1, x2, y2 = box1
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1[0], box1[1], box1[2], box1[3]
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2[0], box2[1], box2[2], box2[3]
+    else:  # transform from xywh to xyxy
+        b1_x1, b1_x2 = box1[0] - box1[2] / 2, box1[0] + box1[2] / 2
+        b1_y1, b1_y2 = box1[1] - box1[3] / 2, box1[1] + box1[3] / 2
+        b2_x1, b2_x2 = box2[0] - box2[2] / 2, box2[0] + box2[2] / 2
+        b2_y1, b2_y2 = box2[1] - box2[3] / 2, box2[1] + box2[3] / 2
+
+    # Intersection area
+    inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
+            (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+
+    # Union Area
+    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+    union = w1 * h1 + w2 * h2 - inter + eps
+
+    iou = inter / union
+    if GIoU or DIoU or CIoU:
+        cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)  # convex (smallest enclosing box) width
+        ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)  # convex height
+        if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
+            c2 = cw ** 2 + ch ** 2 + eps  # convex diagonal squared
+            rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 +
+                    (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center distance squared
+            if DIoU:
+                return iou - rho2 / c2  # DIoU
+            elif CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
+                v = (4 / math.pi ** 2) * torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2)
+                with torch.no_grad():
+                    alpha = v / ((1 + eps) - iou + v)
+                return iou - (rho2 / c2 + v * alpha)  # CIoU
+        else:  # GIoU https://arxiv.org/pdf/1902.09630.pdf
+            c_area = cw * ch + eps  # convex area
+            return iou - (c_area - union) / c_area  # GIoU
+    else:
+        return iou  # IoU
+
+@contextmanager
+def torch_distributed_zero_first(rank: int):
+    """
+    Make all processes in distributed training wait for master to do something.
+    
+    when a process encounters a barrier it will block, a process is blocked by a 
+    barrier until all processes have encountered a barrier, upon which the 
+    barrier is lifted for all processes
+    """
+    if rank != 0:
+        print(f'rank: {rank} encounter barrier 1')
+        torch.distributed.barrier()
+    yield
+    if rank == 0:
+        print(f'rank: {rank} encounter barrier 2')
+        torch.distributed.barrier()
+
+class ModelEMA:
+    """
+    When training a model, it is often beneficial to maintain moving averages 
+    of the trained parameters. Evaluations that use averaged parameters 
+    sometimes produce significantly better results than the final trained values!
+    """
+    def __init__(self, model, decay=0.9999, updates=0):
+        model = deepcopy(model.module if is_parallel(model) else model).eval()
+        self.ema = model
+        self.updates = updates  # number of EMA updates
+        # decay exponential ramp (to help early epochs)
+        self.decay = lambda x: decay * (1 - math.exp(-x / 2000))  
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    def update(self, model):
+        with torch.no_grad():  # Update EMA parameters
+            self.updates += 1
+            d = self.decay(self.updates)
+            
+            # model state_dict
+            msd = model.module.state_dict() if is_parallel(model) else model.state_dict() 
+            for k, v in self.ema.state_dict().items():
+                if v.dtype.is_floating_point:
+                    # note: inplace operation allow concurrent lockless updates
+                    v -= (1. - d) * (v - msd[k].detach())
+
+    def update_attr(self, model, include=(), exclude=('process_group', 'reducer')):
+        copy_attr(self.ema, model, include, exclude)  # Update EMA attributes
+
+def is_parallel(model):
+    return type(model) in (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel)
+
+def copy_attr(a, b, include=(), exclude=()):
+    # Copy attributes from b to a, options to only include [...] and to exclude [...]
+    for k, v in b.__dict__.items():
+        if (len(include) and k not in include) or k.startswith('_') or k in exclude:
+            continue
+        else:
+            setattr(a, k, v)
 
 def count_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -193,7 +305,7 @@ def initialize_weights(model):
         elif t in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6]:
             m.inplace = True
             
-def model_info(model, verbose, img_size):
+def model_info(model, verbose=False, img_size=512):
     n_p = sum(x.numel() for x in model.parameters())  # number parameters
     n_g = sum(x.numel() for x in model.parameters() if x.requires_grad)  # number gradients
     if verbose:

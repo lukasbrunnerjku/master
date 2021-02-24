@@ -6,9 +6,13 @@ import torchvision
 from torchvision import ops
 import sys
 
-sys.path.append('./')
-from utils import (count_params, autopad, fuse_conv_and_bn, 
-    time_synchronized)
+try:
+    sys.path.append('./')
+    from utils import (count_params, autopad, fuse_conv_and_bn, 
+        time_synchronized)
+except ImportError:
+    from .utils import (count_params, autopad, fuse_conv_and_bn, 
+        time_synchronized)
 
 BASE = nn.Conv2d
 GROUPS = 1

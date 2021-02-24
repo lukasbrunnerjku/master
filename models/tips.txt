@@ -1,3 +1,41 @@
+from contextlib import contextmanager
+
+@contextmanager
+def managed_resource(*args, **kwds):
+    # Code to acquire resource, e.g.:
+    resource = acquire_resource(*args, **kwds)
+    try:
+        yield resource
+    finally:
+        # Code to release resource, e.g.:
+        release_resource(resource)
+
+>>> with managed_resource(timeout=3600) as resource:
+...     # Resource is released at the end of this block,
+...     # even if code in the block raises an exception
+
+on linux use:
+>> free -h
+to get statistics over system RAM, on our GPU server 176G RAM was free to use
+-> consider caching images of dataset!
+
+mixed precision guide:
+Typically, mixed precision provides the greatest speedup when the GPU is
+saturated. Small networks may be CPU bound, in which case mixed precision 
+won’t improve performance
+
+Matmul dimensions are not Tensor Core-friendly. Make sure matmuls’ 
+participating sizes are multiples of 8, e.g.
+input channels, output channels, and batch size should be multiples of 8 
+to use tensor cores
+
+A rough rule of thumb to saturate the GPU is to increase batch and/or network
+size(s) as much as you can without running OOM
+
+Try to avoid excessive CPU-GPU synchronization (.item() calls, or printing 
+values from CUDA tensors).
+
+
 Also, once you pin a tensor or storage, you can use asynchronous GPU copies. 
 Just pass an additional non_blocking=True argument to a to() or a cuda() call. 
 This can be used to overlap data transfers with computation.
@@ -34,6 +72,7 @@ avoid unnecessary CPU-GPU synchronization with calls like: print(cuda_tensor),
 cuda_tensor.item(), memory copies: tensor.cuda(), cuda_tensor.cpu(), 
 instead create tensors directly on the target device e.g. 
 torch.rand(size, device=torch.device('cuda'))
+
 
 cuda guide: https://pytorch.org/docs/stable/notes/cuda.html
 get memory consumption currently or max peak since start of script with:

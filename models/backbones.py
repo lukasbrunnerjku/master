@@ -4,9 +4,11 @@ from torch import optim
 from torchvision import models
 import sys
 
-sys.path.append('./')
-from yolo import Yolov5
-from ghostnet import ghostnet
+try:
+    sys.path.append('./')
+    from yolo import Yolov5
+    from ghostnet import ghostnet
+
 
 def get_backbone(model_builder, pretrained=False):
     # model_builder ... either class or function
