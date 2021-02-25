@@ -7,6 +7,7 @@ import time
 from copy import deepcopy
 from torchvision import ops
 from contextlib import contextmanager
+from torch.cuda.amp import autocast
 
 def clip_coords(boxes, img_shape):
     # Clip bounding xyxy bounding boxes to image shape (height, width)
@@ -165,13 +166,18 @@ def time_synchronized():
 def print_structure(model):
     for m in model.children():
         print(m)
-
-def profile(model, device='cuda', img_size=512, nruns=100, verbose=False):
-    x = torch.randn(1, 3, img_size, img_size)
+        
+def profile_FP16(model, device='cuda', img_size=512, nruns=100):
+    x = torch.randn(1, 3, img_size, img_size).half()  # half precision!
     print(f'Input size: {x.size()}')
 
     if torch.cuda.is_available() and 'cuda' in device: 
-        model.cuda().eval()
+        model.half().cuda()  # half precision!
+        for layer in model.modules():
+            if isinstance(layer, nn.BatchNorm2d):
+                layer.float()  # FP32 batchnorm else convergence issue!
+        
+        model.eval() 
         x = x.cuda()
 
         if torch.backends.cudnn.benchmark:
@@ -183,6 +189,28 @@ def profile(model, device='cuda', img_size=512, nruns=100, verbose=False):
         start = time_synchronized()
         for _ in range(nruns):
             o = model(x)
+        end = time_synchronized()
+        print(f'Forward time: {(end - start) * 1000 / nruns:.3f}ms (cuda, FP16)')
+
+def profile(model, device='cuda', img_size=512, nruns=100, verbose=False, amp=False):
+    x = torch.randn(1, 3, img_size, img_size)
+    print(f'Input size: {x.size()}')
+
+    if torch.cuda.is_available() and 'cuda' in device: 
+        model.cuda().eval()
+        x = x.cuda()
+
+        if torch.backends.cudnn.benchmark:
+            # have to do warm up iterations for fair comparison
+            print('benchmark warm up...')
+            with autocast(enabled=amp):
+                for _ in range(50):
+                    _ = model(x)
+        
+        start = time_synchronized()
+        with autocast(enabled=amp):
+            for _ in range(nruns):
+                o = model(x)
         end = time_synchronized()
         print(f'Forward time: {(end - start) * 1000 / nruns:.3f}ms (cuda)')
     else:
@@ -205,7 +233,7 @@ def profile(model, device='cuda', img_size=512, nruns=100, verbose=False):
         else:
             print('output:', o.size())
             
-def profile_training(model, img_size=512, nruns=100):
+def profile_training(model, img_size=512, nruns=100, amp=False):
     x = torch.randn(16, 3, img_size, img_size)
     print(f'Input size: {x.size()}')
 
@@ -224,35 +252,39 @@ def profile_training(model, img_size=512, nruns=100):
     if torch.backends.cudnn.benchmark:
         # have to do warm up iterations for fair comparison
         print('benchmark warm up forward...')
-        for _ in range(50):
-            o = model(x)
+        with autocast(enabled=amp):
+            for _ in range(50):
+                o = model(x)
 
         print('benchmark warm up backward...')
-        for _ in range(50):
-            o = model(x)
-            for param in model.parameters():
-                param.grad = None
-            o = o.values() if isinstance(o, dict) else ([o] if isinstance(o, torch.Tensor) else o)         
-            for i, v in enumerate(o):
-                v.backward(g0[i], retain_graph=i < len(o) - 1)
+        with autocast(enabled=amp):
+            for _ in range(50):
+                o = model(x)
+                for param in model.parameters():
+                    param.grad = None
+                o = o.values() if isinstance(o, dict) else ([o] if isinstance(o, torch.Tensor) else o)         
+                for i, v in enumerate(o):
+                    v.backward(g0[i], retain_graph=i < len(o) - 1)
 
     print(f'run through forward pass for {nruns} runs...')
     start = time_synchronized()
-    for _ in range(nruns):
-        o = model(x)
+    with autocast(enabled=amp):
+        for _ in range(nruns):
+            o = model(x)
     end = time_synchronized()
     fwd_time = end - start  # fwd only
     
     print(f'run through forward and backward pass for {nruns} runs...')
     torch.cuda.reset_peak_memory_stats(device='cuda')
     start = time_synchronized()
-    for _ in range(nruns):
-        o = model(x)
-        for param in model.parameters():
-            param.grad = None
-        o = o.values() if isinstance(o, dict) else ([o] if isinstance(o, torch.Tensor) else o)          
-        for i, v in enumerate(o):
-            v.backward(g0[i], retain_graph=i < len(o) - 1)
+    with autocast(enabled=amp):
+        for _ in range(nruns):
+            o = model(x)
+            for param in model.parameters():
+                param.grad = None
+            o = o.values() if isinstance(o, dict) else ([o] if isinstance(o, torch.Tensor) else o)          
+            for i, v in enumerate(o):
+                v.backward(g0[i], retain_graph=i < len(o) - 1)
     end = time_synchronized()
     mem = torch.cuda.max_memory_reserved(device='cuda')  # bytes
     bwd_time = end - start  # fwd + bwd

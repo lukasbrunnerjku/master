@@ -31,6 +31,35 @@ distributed parallelism = single process per GPU
 instead of only multi-threading multi-GPU usage
 
 exponentially moving average on model weights
+
+next:
+https://pytorch.org/blog/stochastic-weight-averaging-in-pytorch/
+try new optimizer SWA
+note: before doing SWA train the model regulary and then start this technique
+with the pretrained weights!
+-> there hey say that for certain training techniques EMA over model
+weigths is important (e.g. annealing techniques with exploration effect?),
+docs: in SWA we first decay our lr and come closer to a minimu then keep const.
+lr (a high one) and explore loss landscape while taking snapshots of weights,
+instead of high lr at the end annealing techniques can be used as well where
+the weigth snapshot are taken at the end of each annealing process (smallest lr)
+-> SWA can wrap Adam as well
+
+Require:
+    weights wˆ, LR bounds α1, α2,
+    cycle length c (for constant learning rate c = 1), number of iterations n
+Ensure: wSWA
+    w ← wˆ {Initialize weights with wˆ}
+    wSWA ← w
+    for i ← 1, 2, . . . , n do
+        α ← α(i) {Calculate LR for the iteration}
+        w ← w − α∇Li(w) {Stochastic gradient update}
+        if mod(i, c) = 0 then
+            nmodels ← i/c {Number of models}
+            wSWA ← wSWA·nmodels+w/nmodels+1 {Update average}
+        end if
+    end for
+{Compute BatchNorm statistics for wSWA weights}
 """
 
 sys.path.append('./')
@@ -239,14 +268,15 @@ def main(rank, world_size):
         if world_size > 1:  # so shuffle works properly in DDP mode
             sampler.set_epoch(epoch)
         
-        dist.barrier()  # ??
-        
         train(epoch, model, optimizer, scaler, ema, train_dl, 
             loss_fn, writer, rank, world_size, accumulate)
         
-        with torch_distributed_zero_first(rank):
+        #with torch_distributed_zero_first(rank):
+        if rank == 0:
             best_acc = val(epoch, model, val_dl, loss_fn, writer, world_size, best_acc)
-          
+            dist.barrier()
+        else:
+            dist.barrier()
     if rank == 0:
         time_elapsed = time_synchronized() - since
         print(f'Training complete: {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s')

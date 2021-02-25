@@ -4,6 +4,7 @@ from torch import optim
 from torch.nn import functional as F
 import torchvision
 from torchvision import ops
+from torch.cuda.amp import autocast
 import sys
 
 try:
@@ -37,6 +38,7 @@ class DeformConv(nn.Module):
         nn.init.constant_(self.offset.weight, 0)
         nn.init.constant_(self.offset.bias, 0)
 
+    @autocast(enabled=False)
     def forward(self, x):
         return self.conv(x, self.offset(x))
     
