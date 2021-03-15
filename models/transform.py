@@ -13,7 +13,7 @@ class Transform:
         resize_crop=False, bboxes=True, filter=False):
         super().__init__()
         self.h, self.w = opt.h, opt.w  # e.g. 512 x 512
-        self.num_classes = opt.num_classes  # num. of object classes
+        self.classes = opt.classes  # num. of object classes
         self.n_max = opt.n_max  # num. of max objects per image
         self.down_ratio = opt.down_ratio  # => low resolution 128 x 128
         self.mean = opt.mean
@@ -113,7 +113,7 @@ class Transform:
         :return: dictionary
             - image: 3 x 512 x 512
             - bboxes: n x 4; [[x, y, width, height], ...]
-            - cpt_hm: 1 x 128 x 128 # num_classes x 128 x 128
+            - cpt_hm: 1 x 128 x 128 # classes x 128 x 128
             - cpt_off: n_max x 2 low resolution offset - [0, 1)
             - cpt_ind: n_max, low resolution indices - [0, 128^2)
             - cpt_mask: n_max,
@@ -167,7 +167,7 @@ class Transform:
 
         cpt_hms = []
         valid_cpt = cpt[cpt_mask.astype(np.bool)]  # n_valid x 2
-        for i in range(self.num_classes):
+        for i in range(self.classes):
             mask = (cids[:len_valid] == i)  # n_valid,
             xy = valid_cpt[mask]  # n x 2, valid entries for each class
             cpt_hms.append(generate_heatmap((hl, wl), xy))  # each 1 x hl x wl

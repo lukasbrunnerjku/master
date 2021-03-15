@@ -299,12 +299,13 @@ class DLASeg(nn.Module):
     def info(self, verbose=False, img_size=512):  # print model information
         model_info(self, verbose, img_size)
 
-def centernet(heads, num_layers=34, head_conv=256, down_ratio=4):
+def centernet(heads, num_layers=34, head_conv=256, down_ratio=4, pretrained=False):
+    assert pretrained == False, 'Not supporting pretrained backbone in new version.'
     # example: object detection
     # heads = {'cpt_hm': num_classes, 'cpt_off': 2, 'wh': 2}
     model = DLASeg('dla{}'.format(num_layers), heads,
         down_ratio=down_ratio, head_conv=head_conv)
-    initialize_weights(model)  # TODO: try different versions!
+    initialize_weights(model)
     return model
 
 if __name__ == '__main__':

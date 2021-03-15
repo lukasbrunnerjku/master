@@ -1,5 +1,7 @@
 import math
 import torch
+import os
+import torch.distributed as dist
 from torch import nn
 import numpy as np
 import thop
@@ -8,6 +10,21 @@ from copy import deepcopy
 from torchvision import ops
 from contextlib import contextmanager
 from torch.cuda.amp import autocast
+
+def setup(rank, world_size):
+    # A free port on the machine that will host the process with rank 0.
+    os.environ['MASTER_ADDR'] = 'localhost'
+    # IP address of the machine that will host the process with rank 0.
+    os.environ['MASTER_PORT'] = '12355'
+    # The total number of processes, so master knows how many workers to wait for.
+    os.environ['WORLD_SIZE'] = str(world_size)
+    # Rank of each process, so they will know whether it is the master of a worker.
+    os.environ['RANK'] = str(rank)
+    # initialize the process group
+    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
 
 def clip_coords(boxes, img_shape):
     # Clip bounding xyxy bounding boxes to image shape (height, width)
@@ -192,14 +209,16 @@ def profile_FP16(model, device='cuda', img_size=512, nruns=100):
         end = time_synchronized()
         print(f'Forward time: {(end - start) * 1000 / nruns:.3f}ms (cuda, FP16)')
 
-def profile(model, device='cuda', img_size=512, nruns=100, verbose=False, amp=False):
+def profile(model, img_size=512, nruns=100, verbose=False, amp=False):
     x = torch.randn(1, 3, img_size, img_size)
     print(f'Input size: {x.size()}')
+    
+    model.eval()
+    param = next(model.parameters())
+    device = param.device
+    x = x.to(device)
 
-    if torch.cuda.is_available() and 'cuda' in device: 
-        model.cuda().eval()
-        x = x.cuda()
-
+    if param.is_cuda:
         if torch.backends.cudnn.benchmark:
             # have to do warm up iterations for fair comparison
             print('benchmark warm up...')
@@ -214,7 +233,6 @@ def profile(model, device='cuda', img_size=512, nruns=100, verbose=False, amp=Fa
         end = time_synchronized()
         print(f'Forward time: {(end - start) * 1000 / nruns:.3f}ms (cuda)')
     else:
-        model.cpu().eval()
         start = time_synchronized()
         for _ in range(nruns):
             o = model(x)
@@ -233,8 +251,8 @@ def profile(model, device='cuda', img_size=512, nruns=100, verbose=False, amp=Fa
         else:
             print('output:', o.size())
             
-def profile_training(model, img_size=512, nruns=100, amp=False):
-    x = torch.randn(16, 3, img_size, img_size)
+def profile_training(model, img_size=512, nruns=100, amp=False, bsz=16):
+    x = torch.randn(bsz, 3, img_size, img_size)
     print(f'Input size: {x.size()}')
 
     assert torch.cuda.is_available()
@@ -332,8 +350,9 @@ def initialize_weights(model):
         if t is nn.Conv2d:
             pass
         elif t is nn.BatchNorm2d:
-            m.eps = 1e-3
-            m.momentum = 0.03
+            pass
+            # m.eps = 1e-3  # defaut: 1e-5
+            # m.momentum = 0.03  # default: 0.1
         elif t in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6]:
             m.inplace = True
             
